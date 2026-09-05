@@ -368,6 +368,57 @@ public class Camera2Session {
         return 0;
     }
 
+    /**
+     * Orientation for the saved JPEG. Separate from getJpegOrientation(), which
+     * keeps its display/preview semantics for getWorldAngle() and
+     * getCurrentOrientation(). See CameraOptimizationPolicy#stillJpegOrientation.
+     */
+    private int getStillJpegOrientation() {
+        try {
+            Context context = ApplicationLoader.applicationContext;
+            if (context == null) {
+                CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
+                        + " still orientation: no application context, defaulting to 0");
+                return 0;
+            }
+            int rotation = ((WindowManager) context.getSystemService(Context.WINDOW_SERVICE)).getDefaultDisplay().getRotation();
+            int degrees = 0;
+            switch (rotation) {
+                case Surface.ROTATION_0:
+                    degrees = 0;
+                    break;
+                case Surface.ROTATION_90:
+                    degrees = 90;
+                    break;
+                case Surface.ROTATION_180:
+                    degrees = 180;
+                    break;
+                case Surface.ROTATION_270:
+                    degrees = 270;
+                    break;
+            }
+
+            Integer sensorOrientation = cameraCharacteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            if (sensorOrientation == null) {
+                CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
+                        + " still orientation: SENSOR_ORIENTATION missing, defaulting to 0");
+                return 0;
+            }
+            final int still = CameraOptimizationPolicy.stillJpegOrientation(sensorOrientation, degrees, isFront);
+            CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
+                    + " still orientation chain: front=" + isFront
+                    + " sensorOrientation=" + sensorOrientation
+                    + " displayRotation=" + degrees
+                    + " stillJpeg=" + still
+                    + " displayAngle=" + getJpegOrientation()
+                    + " mirroredDownstream=false");
+            return still;
+        } catch (Exception e) {
+            CameraAutoOptimizer.error("Camera2Session camera #" + cameraId + " still orientation failed", e);
+        }
+        return 0;
+    }
+
     public int getWorldAngle() {
         int displayOrientation = getDisplayOrientation();
         int jpegOrientation = getJpegOrientation();
@@ -587,7 +638,7 @@ public class Camera2Session {
         }
         try {
             CaptureRequest.Builder captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-            final int orientation = getJpegOrientation();
+            final int orientation = getStillJpegOrientation();
             captureRequestBuilder.set(CaptureRequest.JPEG_ORIENTATION, orientation);
             imageReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
                 @Override
@@ -626,7 +677,8 @@ public class Camera2Session {
             }
             captureRequestBuilder.addTarget(imageReader.getSurface());
             CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " still capture orientation="
-                    + orientation + " recording=" + recordingVideo + " barcode=" + scanningBarcode);
+                    + orientation + " front=" + isFront + " recording=" + recordingVideo
+                    + " barcode=" + scanningBarcode);
             autoOptimizer.capture(captureSession, captureRequestBuilder, cameraCharacteristics,
                     previewSize, cameraId, recordingVideo, scanningBarcode || nightMode, handler);
             return true;

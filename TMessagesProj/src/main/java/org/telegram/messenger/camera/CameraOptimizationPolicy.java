@@ -6,7 +6,7 @@ package org.telegram.messenger.camera;
 
 /** Pure policy, shared by Camera1 (millifps) and Camera2 (fps). */
 public final class CameraOptimizationPolicy {
-    public static final String VERSION = "0.1.3";
+    public static final String VERSION = "0.1.4";
     public static final int TARGET_VIDEO_FPS = 30;
 
     private CameraOptimizationPolicy() {}
@@ -34,6 +34,33 @@ public final class CameraOptimizationPolicy {
     }
 
     /** A few legacy Camera2 HALs advertise millifps instead of fps. */
+    /**
+     * Orientation (degrees clockwise) for the EXIF tag of a still JPEG.
+     *
+     * displayRotationDegrees is the *display* rotation from
+     * Display.getRotation(), which is the inverse of the physical device
+     * rotation reported by OrientationEventListener. The Camera1 still-capture
+     * path in CameraSession is the reference implementation; it uses the
+     * physical rotation and the convention
+     *   front: (sensor - physical + 360) % 360
+     *   back:  (sensor + physical) % 360
+     * Substituting physical = (360 - display) % 360 yields the two branches
+     * below, so Camera1 and Camera2 agree on the saved orientation.
+     *
+     * This is deliberately NOT the preview/display angle. The front preview is
+     * mirrored on screen, so the display path compensates with (360 - angle);
+     * a saved JPEG is not mirrored on the Camera2 path, and applying that
+     * compensation to the EXIF tag rotated front-camera stills by 180 degrees.
+     */
+    public static int stillJpegOrientation(int sensorOrientation, int displayRotationDegrees, boolean front) {
+        final int sensor = ((sensorOrientation % 360) + 360) % 360;
+        final int display = ((displayRotationDegrees % 360) + 360) % 360;
+        if (front) {
+            return (sensor + display) % 360;
+        }
+        return (sensor - display + 360) % 360;
+    }
+
     public static int camera2FpsScale(int[][] ranges) {
         boolean found = false;
         if (ranges == null) return 1;
