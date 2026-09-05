@@ -8,6 +8,7 @@ import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.os.Handler;
@@ -20,9 +21,30 @@ import java.util.List;
 @TargetApi(21)
 final class Camera2AutoOptimizer {
     private volatile Attempt current;
+    private volatile CameraHardwareBenchmark.Recording recordingBenchmark;
+    private volatile boolean photoBenchmarks, photoFrozen;
+    private volatile int photoCandidate;
+
+    void allowPhotoBenchmarks(boolean allow) { photoBenchmarks = allow; }
+    void recordingBenchmark(CameraHardwareBenchmark.Recording run) { recordingBenchmark = run; }
+    void invalidateRecording(String reason) {
+        CameraHardwareBenchmark.Recording run = recordingBenchmark;
+        if (run != null) run.invalidate(reason);
+    }
+    void freezePhoto() {
+        photoFrozen = true;
+        Attempt a = current;
+        if (a != null) a.cancelProbe("user shutter");
+    }
+    void resumePhoto() { photoFrozen = false; }
+    int photoCandidate() { return photoCandidate; }
 
     void stop() {
+        Attempt a = current;
         current = null;
+        if (a != null) a.cancelProbe("camera stopped");
+        CameraHardwareBenchmark.Recording run = recordingBenchmark;
+        if (run != null) run.cameraStopped();
     }
 
     private static boolean canSet(CameraCharacteristics characteristics, CaptureRequest.Key<?> key) {
@@ -127,6 +149,37 @@ final class Camera2AutoOptimizer {
                 + " canOis=" + canOis + " canEis=" + canEis;
     }
 
+    private static String requestSignature(CaptureRequest request) {
+        return "af=" + request.get(CaptureRequest.CONTROL_AF_MODE)
+                + ",awb=" + request.get(CaptureRequest.CONTROL_AWB_MODE)
+                + ",anti=" + request.get(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE)
+                + ",fps=" + request.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)
+                + ",ois=" + request.get(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE)
+                + ",eis=" + request.get(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE);
+    }
+
+    /** One additional advertised configuration, never fabricated FPS or AF triggers. */
+    private static void alternative(CaptureRequest.Builder builder, CameraCharacteristics c, boolean video) {
+        if (video) {
+            int[] ois = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION);
+            int[] eis = c.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES);
+            if (has(ois, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF))
+                set(builder, c, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF);
+            if (has(eis, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF))
+                set(builder, c, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
+        } else {
+            Range<Integer> current = builder.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE);
+            Range<Integer>[] advertised = c.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+            if (current != null && advertised != null) {
+                int[][] ranges = new int[advertised.length][];
+                for (int i = 0; i < ranges.length; i++) if (advertised[i] != null)
+                    ranges[i] = new int[]{advertised[i].getLower(), advertised[i].getUpper()};
+                int best = CameraOptimizationPolicy.chooseFpsRange(ranges, current.getUpper(), true);
+                if (best >= 0) set(builder, c, CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, advertised[best]);
+            }
+        }
+    }
+
     private static String list(int[] values) {
         return values == null ? "null" : Arrays.toString(values);
     }
@@ -171,6 +224,8 @@ final class Camera2AutoOptimizer {
                    boolean video, boolean bypass, Handler handler) throws CameraAccessException {
         Attempt attempt = new Attempt(session, builder, characteristics, size, cameraId,
                 video, false, bypass, handler);
+        Attempt previous = current;
+        if (previous != null) previous.cancelProbe("request replaced");
         current = attempt;
         attempt.start();
     }
@@ -200,6 +255,18 @@ final class Camera2AutoOptimizer {
         boolean fallback;
         boolean completed;
         int failures;
+        final String cameraId;
+        final String stream;
+        final boolean video;
+        CaptureRequest[] candidates;
+        int mask;
+        String candidateSignature;
+        CameraHardwareBenchmark.Probe measured;
+        int trials;
+        CameraHardwareBenchmark.Book rejectedBook;
+        int rejectedCandidate;
+        boolean canMeasure;
+        final Runnable watchdog = this::benchmarkTimeout;
 
         Attempt(CameraCaptureSession session, CaptureRequest.Builder builder,
                 CameraCharacteristics characteristics, Size size, String cameraId,
@@ -207,6 +274,9 @@ final class Camera2AutoOptimizer {
             this.session = session;
             this.handler = handler;
             this.still = still;
+            this.video = video;
+            this.cameraId = cameraId;
+            this.stream = size.toString();
             baseline = builder.build(); // Immutable snapshot before touching optional keys.
             expected = baseline;
             profile = CameraAutoOptimizer.profile("camera2", cameraId,
@@ -227,6 +297,20 @@ final class Camera2AutoOptimizer {
                     summary = tune(builder, characteristics, size, video, still);
                     expected = builder.build();
                     optimized = true;
+                    if (still && !video && photoCandidate == CameraHardwareBenchmark.TEMPLATE) {
+                        expected = baseline;
+                        optimized = false;
+                    } else if (!still) {
+                        candidates = new CaptureRequest[]{expected, expected, baseline};
+                        alternative(builder, characteristics, video);
+                        candidates[1] = builder.build();
+                        mask = 7;
+                        String a = requestSignature(candidates[0]), b = requestSignature(candidates[1]), c = requestSignature(baseline);
+                        if (a.equals(b)) mask &= ~2;
+                        if (a.equals(c) || b.equals(c)) mask &= ~4;
+                        candidateSignature = a + "/" + b + "/" + c;
+                        canMeasure = true;
+                    }
                 } catch (RuntimeException e) {
                     fallback = true;
                     CameraAutoOptimizer.error(profile.label + " optional request construction failed", e);
@@ -240,15 +324,125 @@ final class Camera2AutoOptimizer {
         }
 
         void start() throws CameraAccessException {
+            if (canMeasure) {
+                if (video) {
+                    CameraHardwareBenchmark.Recording run = recordingBenchmark;
+                    if (run != null) measured = run.bind(stream, mask, candidateSignature);
+                } else if (photoBenchmarks && !photoFrozen) {
+                    measured = CameraHardwareBenchmark.photo(cameraId, stream, mask, candidateSignature);
+                }
+                if (measured != null) {
+                    choose(measured.candidate);
+                    handler.postDelayed(watchdog, 5500);
+                }
+            }
             try {
                 send();
             } catch (CameraAccessException | RuntimeException e) {
-                if (!optimized) throw e;
+                if (measured != null) {
+                    restoreMeasured(e);
+                    return;
+                }
+                if (!optimized) {
+                    cancelProbe("baseline unavailable");
+                    throw e;
+                }
+                cancelProbe("request rejected");
+                invalidateRecording("request rejected");
                 CameraAutoOptimizer.error(profile.label + " optional request rejected; retry template", e);
                 expected = baseline;
                 optimized = false;
                 fallback = true;
                 send(); // One retry. No persistent blacklist until a real result arrives.
+            }
+        }
+
+        void restoreMeasured(Exception error) throws CameraAccessException {
+            rejectedBook = measured.book;
+            rejectedCandidate = measured.candidate;
+            cancelProbe("candidate rejected");
+            measured = null;
+            invalidateRecording("candidate rejected; fallback must not be scored as the original candidate");
+            CameraAutoOptimizer.error(profile.label + " measured candidate rejected; restore working request", error);
+            choose(rejectedCandidate == CameraHardwareBenchmark.BALANCED
+                    ? CameraHardwareBenchmark.TEMPLATE : CameraHardwareBenchmark.BALANCED);
+            fallback = false; // A failed alternative does not disable ALL optional tuning.
+            try { send(); }
+            catch (CameraAccessException | RuntimeException retry) {
+                if (expected == baseline) { rejectedBook = null; throw retry; }
+                choose(CameraHardwareBenchmark.TEMPLATE);
+                try { send(); }
+                catch (CameraAccessException | RuntimeException unavailable) { rejectedBook = null; throw unavailable; }
+            }
+        }
+
+        void choose(int index) {
+            expected = candidates[index];
+            optimized = index != CameraHardwareBenchmark.TEMPLATE;
+            completed = false;
+            summary = requestSignature(expected) + " measuredCandidate=" + index;
+            if (!video) photoCandidate = index;
+        }
+
+        void cancelProbe(String reason) {
+            handler.removeCallbacks(watchdog);
+            if (measured != null && !video) measured.cancel(reason);
+        }
+
+        void benchmarkTimeout() {
+            if (current != this || measured == null || measured.done) return;
+            if (!measured.ready()) measured.invalidate("no complete sensor window before timeout");
+            if (!video && !photoFrozen) advancePhoto();
+        }
+
+        void advancePhoto() {
+            handler.removeCallbacks(watchdog);
+            measured.finishPhoto();
+            int best = measured.book.best();
+            boolean complete = measured.book.complete();
+            measured = null;
+            if (current != this || photoFrozen) return;
+            if (++trials < 3 && !complete && photoBenchmarks) {
+                measured = CameraHardwareBenchmark.photo(cameraId, stream, mask, candidateSignature);
+            }
+            if (measured != null) {
+                choose(measured.candidate);
+                handler.postDelayed(watchdog, 5500);
+            } else {
+                choose(best);
+                CameraAutoOptimizer.log(profile.label + " probe sequence stopped; selected=" + best
+                        + " allCandidatesMeasured=" + complete + " (continue next camera open if incomplete)");
+            }
+            try { send(); }
+            catch (CameraAccessException | RuntimeException e) {
+                try {
+                    if (measured != null) restoreMeasured(e);
+                    else {
+                        choose(CameraHardwareBenchmark.TEMPLATE);
+                        send();
+                    }
+                } catch (CameraAccessException | RuntimeException unavailable) {
+                    cancelProbe("camera unavailable during probe");
+                    CameraAutoOptimizer.error(profile.label + " template restore failed", unavailable);
+                }
+            }
+        }
+
+        void measure(TotalCaptureResult result) {
+            Long timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP);
+            Long exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+            Integer iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+            long exposureNs = exposure == null ? -1 : exposure;
+            int sensitivity = iso == null ? -1 : iso;
+            CameraHardwareBenchmark.captureLight(cameraId, exposureNs, sensitivity);
+            if (measured == null || measured.done || !video && photoFrozen) return;
+            Integer af = result.get(CaptureResult.CONTROL_AF_STATE);
+            Integer ae = result.get(CaptureResult.CONTROL_AE_STATE);
+            measured.frame(timestamp == null ? -1 : timestamp,
+                    af == null ? -1 : af, ae == null ? -1 : ae, exposureNs, sensitivity);
+            if (measured.ready()) {
+                handler.removeCallbacks(watchdog);
+                if (!video) advancePhoto();
             }
         }
 
@@ -260,21 +454,41 @@ final class Camera2AutoOptimizer {
         public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request, TotalCaptureResult result) {
             if (!active(request)) return;
             failures = 0;
-            if (completed) return;
-            completed = true;
-            if (fallback) profile.disable("template produced a capture result");
-            else if (optimized) profile.accept(summary + " (capture result received)");
+            if (rejectedBook != null) {
+                rejectedBook.reject(rejectedCandidate);
+                rejectedBook = null;
+            }
+            if (!completed) {
+                completed = true;
+                if (fallback) profile.disable("template produced a capture result");
+                else if (optimized) profile.accept(summary + " (capture result received)");
+            }
+            if (!still) measure(result);
         }
 
         @Override
         public void onCaptureFailed(CameraCaptureSession session, CaptureRequest request, CaptureFailure failure) {
             if (!active(request) || failure.getReason() != CaptureFailure.REASON_ERROR) return;
+            if (measured != null) {
+                synchronized (measured) { measured.sensor.errors++; measured.invalidate("capture error"); }
+            }
             if (still) {
                 // Never automatically retry an accepted still capture: could duplicate a photo.
                 CameraAutoOptimizer.log(profile.label + " still capture failed; no automatic recapture");
                 return;
             }
+            if (measured != null) {
+                if (++failures < 3) return;
+                failures = 0;
+                try { restoreMeasured(new IllegalStateException("three consecutive capture errors")); }
+                catch (CameraAccessException | RuntimeException e) {
+                    CameraAutoOptimizer.error(profile.label + " measured fallback unavailable", e);
+                }
+                return;
+            }
             if (!optimized || ++failures < 3) return;
+            cancelProbe("capture errors");
+            invalidateRecording("capture errors");
             CameraAutoOptimizer.log(profile.label + " three consecutive capture errors; retry template once");
             expected = baseline;
             optimized = false;

@@ -2354,6 +2354,20 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
 
 
     private class VideoRecorder implements Runnable {
+        private Camera2Session benchmarkCamera;
+        private volatile CameraHardwareBenchmark.Recording hardwareRun;
+        private Integer benchmarkFrameCamera;
+
+        private void invalidateHardwareRun(String reason) {
+            CameraHardwareBenchmark.Recording run = hardwareRun;
+            if (run != null) run.invalidate(reason);
+        }
+
+        private void finishHardwareRun(boolean success) {
+            CameraHardwareBenchmark.Recording run = hardwareRun;
+            if (run != null && benchmarkCamera != null) benchmarkCamera.finishHardwareRecording(run, success);
+        }
+
 
         private static final String VIDEO_MIME_TYPE = "video/hevc";
         private static final String AUDIO_MIME_TYPE = "audio/mp4a-latm";
@@ -2446,6 +2460,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                         try {
                             audioRecorder.stop();
                         } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                             done = true;
                         }
                         if (sendWhenDone == 0) {
@@ -2503,6 +2518,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                             try {
                                 buffers.put(buffer);
                             } catch (Exception ignore) {
+                    invalidateHardwareRun("recorder or muxer exception");
 
                             }
                         }
@@ -2511,6 +2527,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                 try {
                     audioRecorder.release();
                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                     FileLog.e(e);
                 }
                 handler.sendMessage(handler.obtainMessage(MSG_STOP_RECORDING, sendWhenDone, 0));
@@ -2534,6 +2551,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
             }
 
             videoFile = outputFile;
+            benchmarkCamera = cameraSessionRecording == null ? null : cameraSessionRecording.camera2Session;
 
             if (cameraSession[0].getWorldAngle() == 90 || cameraSession[0].getWorldAngle() == 270) {
                 videoWidth = pictureSize.getWidth();
@@ -2556,6 +2574,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                     try {
                         sync.wait();
                     } catch (InterruptedException ie) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         // ignore
                     }
                 }
@@ -2572,6 +2591,8 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
         }
 
         public void frameAvailable(SurfaceTexture st, Integer cameraId, long timestampInternal) {
+            if (benchmarkFrameCamera == null) benchmarkFrameCamera = cameraId;
+            else if (!benchmarkFrameCamera.equals(cameraId)) invalidateHardwareRun("camera changed during clip");
             synchronized (sync) {
                 if (!ready) {
                     return;
@@ -2674,6 +2695,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
             try {
                 drainEncoder(false);
             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 FileLog.e(e);
             }
             try {
@@ -2729,6 +2751,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
             try {
                 drainEncoder(false);
             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 FileLog.e(e);
             }
             long dt;
@@ -2888,6 +2911,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
             try {
                 drainEncoder(true);
             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 FileLog.e(e);
             }
             if (videoEncoder != null) {
@@ -2896,6 +2920,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                     videoEncoder.release();
                     videoEncoder = null;
                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                     FileLog.e(e);
                 }
             }
@@ -2905,6 +2930,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                     audioEncoder.release();
                     audioEncoder = null;
                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                     FileLog.e(e);
                 }
             }
@@ -2913,6 +2939,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                 try {
                     mediaMuxer.finishMovie();
                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                     e.printStackTrace();
                 }
                 countDownLatch.countDown();
@@ -2920,6 +2947,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
             try {
                 countDownLatch.await();
             } catch (InterruptedException e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 e.printStackTrace();
             }
 
@@ -2930,12 +2958,14 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                         AndroidUtilities.copyFile(fileToWrite, videoFile);
                         fileToWrite.delete();
                     } catch (IOException e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         FileLog.e(e);
                         FileLog.e("unable to move file");
                     }
                 }
             }
 
+            finishHardwareRun(true);
             EGL14.eglDestroySurface(eglDisplay, eglSurface);
             eglSurface = EGL14.EGL_NO_SURFACE;
             if (surface != null) {
@@ -3037,6 +3067,10 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                 videoEncoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                 surface = videoEncoder.createInputSurface();
                 videoEncoder.start();
+                if (benchmarkCamera != null) {
+                    hardwareRun = benchmarkCamera.beginHardwareRecording(CameraHardwareBenchmark.VIDEO,
+                            videoWidth, videoHeight, videoBitrate, videoEncoder.getName());
+                }
 
                 boolean isSdCard = ImageLoader.isSdCardPath(videoFile);
                 fileToWrite = videoFile;
@@ -3062,6 +3096,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                 mediaMuxer.setAllowSyncFiles(false);
 
             } catch (Exception ioe) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 throw new RuntimeException(ioe);
             }
 
@@ -3208,6 +3243,9 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                     }
                     if (videoBufferInfo.size > 1) {
                         if ((videoBufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                            CameraHardwareBenchmark.Recording run = hardwareRun;
+                            if (run != null && (videoBufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0)
+                                run.frame(videoBufferInfo.presentationTimeUs, videoBufferInfo.size);
                             if (prependHeaderSize != 0 && (videoBufferInfo.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
                                 videoBufferInfo.offset += prependHeaderSize;
                                 videoBufferInfo.size -= prependHeaderSize;
@@ -3226,6 +3264,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                                 try {
                                     mediaMuxer.writeSampleData(videoTrackIndex, byteBuffer, bufferInfo, true);
                                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                                     FileLog.e(e);
                                 }
                             });
@@ -3301,6 +3340,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
                             try {
                                 mediaMuxer.writeSampleData(audioTrackIndex, byteBuffer, bufferInfo, false);
                             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                                 FileLog.e(e);
                             }
                         });

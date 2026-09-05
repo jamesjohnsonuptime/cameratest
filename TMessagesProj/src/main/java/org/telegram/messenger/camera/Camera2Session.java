@@ -22,6 +22,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
 import android.util.Log;
+import android.util.Pair;
 import android.util.Size;
 import android.util.SizeF;
 import android.view.Surface;
@@ -37,6 +38,7 @@ import org.telegram.messenger.MessagesController;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.Utilities;
 
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -54,6 +56,27 @@ public class Camera2Session {
     private boolean isSuccess;
     private volatile boolean isClosed;
     private final Camera2AutoOptimizer autoOptimizer = new Camera2AutoOptimizer();
+    private volatile CameraHardwareBenchmark.Recording hardwareRecording;
+
+    /** Called only after a real MediaCodec has started, so its identity is known. */
+    public CameraHardwareBenchmark.Recording beginHardwareRecording(String useCase, int width, int height,
+                                                                    int bitrate, String codec) {
+        CameraHardwareBenchmark.Recording run = new CameraHardwareBenchmark.Recording(cameraId, useCase, width, height, bitrate);
+        run.codec(codec);
+        hardwareRecording = run;
+        autoOptimizer.recordingBenchmark(run);
+        recordingVideo = true;
+        updateCaptureRequest();
+        return run;
+    }
+
+    public void finishHardwareRecording(CameraHardwareBenchmark.Recording run, boolean success) {
+        run.finish(success);
+        if (hardwareRecording == run) {
+            hardwareRecording = null;
+            autoOptimizer.recordingBenchmark(null);
+        }
+    }
 
     private final CameraManager cameraManager;
     private final boolean isFront;
@@ -163,6 +186,9 @@ public class Camera2Session {
 
             @Override
             public void onDisconnected(@NonNull CameraDevice camera) {
+                autoOptimizer.invalidateRecording("device disconnected");
+                autoOptimizer.stop();
+                CameraHardwareBenchmark.cameraClosed(Camera2Session.this);
                 Camera2Session.this.cameraDevice = camera;
                 FileLog.d("Camera2Session camera #" + cameraId + " disconnected");
                 CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " device disconnected "
@@ -171,6 +197,9 @@ public class Camera2Session {
 
             @Override
             public void onError(@NonNull CameraDevice camera, int error) {
+                autoOptimizer.invalidateRecording("device error");
+                autoOptimizer.stop();
+                CameraHardwareBenchmark.cameraClosed(Camera2Session.this);
                 Camera2Session.this.cameraDevice = camera;
                 FileLog.e("Camera2Session camera #" + cameraId + " received " + error + " error");
                 CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " device error=" + error
@@ -234,8 +263,10 @@ public class Camera2Session {
             maxZoom = (value == null || value < 1f) ? 1f : value;
             CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " opening front=" + isFront
                     + " preview=" + size + " sensor=" + sensorSize + " maxZoom=" + maxZoom);
+            CameraHardwareBenchmark.cameraOpened(this);
             cameraManager.openCamera(cameraId, cameraStateCallback, handler);
         } catch (Exception e) {
+            CameraHardwareBenchmark.cameraClosed(this);
             CameraAutoOptimizer.error("Camera2Session camera #" + cameraId + " openCamera failed", e);
             FileLog.e(e);
             AndroidUtilities.runOnUIThread(() -> {
@@ -438,6 +469,7 @@ public class Camera2Session {
         if (!isInitiated()) return;
         if (captureRequestBuilder == null || cameraDevice == null || sensorSize == null) return;
 
+        autoOptimizer.invalidateRecording("zoom changed during recording");
         currentZoom = Utilities.clamp(value, maxZoom, 1f);
         updateCaptureRequest();
     }
@@ -445,6 +477,7 @@ public class Camera2Session {
     private volatile boolean flashing;
     public void setFlash(boolean flash) {
         if (flashing != flash) {
+            autoOptimizer.invalidateRecording("flash changed during recording");
             flashing = flash;
             updateCaptureRequest();
         }
@@ -483,6 +516,7 @@ public class Camera2Session {
                 + " alive=" + (System.currentTimeMillis() - createdTime) + "ms");
         isClosed = true;
         autoOptimizer.stop();
+        CameraHardwareBenchmark.cameraClosed(this);
         if (async) {
             handler.post(() -> {
                 if (captureSession != null) {
@@ -621,6 +655,9 @@ public class Camera2Session {
             }
 
             captureRequestBuilder.addTarget(surface);
+            final boolean neutralScene = !scanningBarcode && !nightMode && !flashing && Math.abs(currentZoom - 1f) < 0.01f;
+            autoOptimizer.allowPhotoBenchmarks(neutralScene && !recordingVideo);
+            if (!neutralScene) autoOptimizer.invalidateRecording("special scene/flash/zoom excluded from calibration");
             autoOptimizer.repeating(captureSession, captureRequestBuilder, cameraCharacteristics,
                     previewSize, cameraId, recordingVideo, scanningBarcode || nightMode, handler);
             return true;
@@ -636,6 +673,8 @@ public class Camera2Session {
                     + " device=" + (cameraDevice != null) + " session=" + (captureSession != null));
             return false;
         }
+        autoOptimizer.freezePhoto();
+        final CameraHardwareBenchmark.Shot benchmarkShot = new CameraHardwareBenchmark.Shot(cameraId, autoOptimizer.photoCandidate());
         try {
             CaptureRequest.Builder captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             final int orientation = getStillJpegOrientation();
@@ -644,30 +683,44 @@ public class Camera2Session {
                 @Override
                 public void onImageAvailable(ImageReader reader) {
                     Image image = reader.acquireLatestImage();
+                    if (image == null) {
+                        CameraAutoOptimizer.log("benchmark photo: null JPEG image; not a successful capture");
+                        return;
+                    }
                     ByteBuffer buffer = image.getPlanes()[0].getBuffer();
                     byte[] bytes = new byte[buffer.remaining()];
                     buffer.get(bytes);
 
-                    FileOutputStream output = null;
+                    boolean saved = false;
                     try {
-                        output = new FileOutputStream(file);
-                        output.write(bytes);
+                        try (FileOutputStream output = new FileOutputStream(file)) {
+                            output.write(bytes);
+                            output.flush();
+                        }
+                        saved = true; // Includes successful close, not just write acceptance.
                     } catch (IOException e) {
-                        e.printStackTrace();
+                        FileLog.e(e);
                     } finally {
                         image.close();
-                        if (null != output) {
-                            try {
-                                output.close();
-                            } catch (IOException e) {
-                                e.printStackTrace();
-                            }
-                        }
                     }
 
+                    // JPEG_ORIENTATION is a request, not the residual rotation of
+                    // the encoded JPEG. A HAL may rotate pixels instead of EXIF.
+                    final Pair<Integer, Integer> jpegTransform = AndroidUtilities.getImageOrientation(
+                            new ByteArrayInputStream(bytes));
+                    benchmarkShot.finish(bytes.length, jpegTransform.first, saved);
+                    handler.post(() -> {
+                        autoOptimizer.resumePhoto();
+                        if (!isClosed && !recordingVideo) updateCaptureRequest();
+                    });
+                    CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
+                            + " jpeg result: requested=" + orientation
+                            + " exifRotation=" + jpegTransform.first
+                            + " exifInvert=" + jpegTransform.second
+                            + " bytes=" + bytes.length + " front=" + isFront);
                     AndroidUtilities.runOnUIThread(() -> {
                         if (whenDone != null) {
-                            whenDone.run(orientation);
+                            whenDone.run(jpegTransform.first);
                         }
                     });
                 }
@@ -683,6 +736,8 @@ public class Camera2Session {
                     previewSize, cameraId, recordingVideo, scanningBarcode || nightMode, handler);
             return true;
         } catch (Exception e) {
+            autoOptimizer.resumePhoto();
+            benchmarkShot.finish(0, -1, false);
             FileLog.e("Camera2Sessions takePicture error", e);
             return false;
         }

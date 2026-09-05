@@ -6,7 +6,7 @@ package org.telegram.messenger.camera;
 
 /** Pure policy, shared by Camera1 (millifps) and Camera2 (fps). */
 public final class CameraOptimizationPolicy {
-    public static final String VERSION = "0.1.4";
+    public static final String VERSION = "0.1.6";
     public static final int TARGET_VIDEO_FPS = 30;
 
     private CameraOptimizationPolicy() {}
@@ -33,7 +33,6 @@ public final class CameraOptimizationPolicy {
         return best;
     }
 
-    /** A few legacy Camera2 HALs advertise millifps instead of fps. */
     /**
      * Orientation (degrees clockwise) for the EXIF tag of a still JPEG.
      *
@@ -61,6 +60,7 @@ public final class CameraOptimizationPolicy {
         return (sensor - display + 360) % 360;
     }
 
+    /** A few legacy Camera2 HALs advertise millifps instead of fps. */
     public static int camera2FpsScale(int[][] ranges) {
         boolean found = false;
         if (ranges == null) return 1;

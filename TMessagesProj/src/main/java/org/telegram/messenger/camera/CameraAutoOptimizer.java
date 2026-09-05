@@ -28,7 +28,7 @@ public final class CameraAutoOptimizer {
 
     private CameraAutoOptimizer() {}
 
-    private static SharedPreferences preferences() {
+    static SharedPreferences preferences() {
         return ApplicationLoader.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
