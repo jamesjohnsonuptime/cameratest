@@ -8,8 +8,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout code with submodules
         uses: actions/checkout@v4
+        with:
+          # Скачиваем абсолютно все вложенные репозитории, включая jlatexmath
+          submodules: 'recursive'
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -30,12 +34,11 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Official Telegram Debug APK
-        # Используем стандартную команду assembleDebug, которую нашел сам Gradle
-        run: ./gradlew assembleDebug -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" --stacktrace
+        # Добавляем флаг --no-build-cache, чтобы старый ошибочный лог не мешал сборке
+        run: ./gradlew assembleDebug -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" --no-build-cache --stacktrace
 
       - name: Upload Finished APK
         uses: actions/upload-artifact@v4
         with:
           name: Official-Telegram-Custom
-          # Ищем любые скомпилированные APK в папках вывода проекта
           path: "**/build/outputs/apk/**/*.apk"
