@@ -89,6 +89,7 @@ import org.telegram.messenger.Utilities;
 import org.telegram.messenger.VideoEditedInfo;
 import org.telegram.messenger.camera.Camera2Session;
 import org.telegram.messenger.camera.CameraAutoOptimizer;
+import org.telegram.messenger.camera.CameraHardwareBenchmark;
 import org.telegram.messenger.camera.CameraController;
 import org.telegram.messenger.camera.CameraInfo;
 import org.telegram.messenger.camera.CameraSession;
@@ -2108,6 +2109,20 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
     }
 
     private class VideoRecorder implements Runnable {
+        private Camera2Session benchmarkCamera;
+        private volatile CameraHardwareBenchmark.Recording hardwareRun;
+        private Integer benchmarkFrameCamera;
+
+        private void invalidateHardwareRun(String reason) {
+            CameraHardwareBenchmark.Recording run = hardwareRun;
+            if (run != null) run.invalidate(reason);
+        }
+
+        private void finishHardwareRun(boolean success) {
+            CameraHardwareBenchmark.Recording run = hardwareRun;
+            if (run != null && benchmarkCamera != null) benchmarkCamera.finishHardwareRecording(run, success);
+        }
+
 
         private static final String VIDEO_MIME_TYPE = "video/avc";
         private static final String AUDIO_MIME_TYPE = "audio/mp4a-latm";
@@ -2212,6 +2227,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                         try {
                             audioRecorder.stop();
                         } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                             done = true;
                         }
                         if (sendWhenDone == 0) {
@@ -2263,6 +2279,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                                 audioRecorder.getTimestamp(audioTimestamp, AudioTimestamp.TIMEBASE_MONOTONIC);
                                 timestamp = audioTimestamp.nanoTime / 1000;
                             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                                 FileLog.e(e);
                                 shouldUseTimestamp = false;
                                 timestamp = audioPresentationTimeUs = System.nanoTime() / 1000;
@@ -2290,6 +2307,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                             try {
                                 buffers.put(buffer);
                             } catch (Exception ignore) {
+                    invalidateHardwareRun("recorder or muxer exception");
 
                             }
                         }
@@ -2298,6 +2316,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                 try {
                     audioRecorder.release();
                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                     FileLog.e(e);
                 }
                 if (!pauseRecorder) {
@@ -2315,6 +2334,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
             }
 
             started = true;
+            if (hardwareRun == null) benchmarkCamera = camera2SessionCurrent;
             int resolution = MessagesController.getInstance(currentAccount).roundVideoSize;
             int bitrate = MessagesController.getInstance(currentAccount).roundVideoBitrate * 1024;
             AndroidUtilities.runOnUIThread(() -> {
@@ -2339,6 +2359,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                     try {
                         sync.wait();
                     } catch (InterruptedException ie) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         // ignore
                     }
                 }
@@ -2376,6 +2397,8 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
 
         long prevTimestamp;
         public void frameAvailable(SurfaceTexture st, Integer cameraId, long timestampInternal) {
+            if (benchmarkFrameCamera == null) benchmarkFrameCamera = cameraId;
+            else if (!benchmarkFrameCamera.equals(cameraId)) invalidateHardwareRun("camera changed during clip");
             synchronized (sync) {
                 if (!ready) {
                     return;
@@ -2481,6 +2504,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
             try {
                 drainEncoder(false);
             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 FileLog.e(e);
             }
             try {
@@ -2552,6 +2576,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
             try {
                 drainEncoder(false);
             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 FileLog.e(e);
             }
             long dt, alphaDt;
@@ -2719,6 +2744,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                             }
                         });
                     } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         FileLog.e(e);
                     }
 
@@ -2727,6 +2753,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
         }
 
         private void handlePauseRecording() {
+            invalidateHardwareRun("recording paused; do not learn from a discontinuous clip");
             pauseRecorder = true;
             if (previewFile != null) {
                 previewFile.delete();
@@ -2737,6 +2764,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                 FileLog.d("InstantCamera handlePauseRecording drain encoders");
                 drainEncoder(false);
             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 FileLog.e(e);
             }
 //            if (videoEncoder != null) {
@@ -2745,6 +2773,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
 //                    videoEncoder.release();
 //                    videoEncoder = null;
 //                } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
 //                    FileLog.e(e);
 //                }
 //            }
@@ -2756,6 +2785,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
 //
 //                    setBluetoothScoOn(false);
 //                } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
 //                    FileLog.e(e);
 //                }
 //            }
@@ -2766,6 +2796,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                         try {
                             mediaMuxer.finishMovie(previewFile);
                         } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                             e.printStackTrace();
                         }
                         countDownLatch.countDown();
@@ -2773,12 +2804,14 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                     try {
                         countDownLatch.await();
                     } catch (InterruptedException e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         e.printStackTrace();
                     }
                 } else {
                     try {
                         mediaMuxer.finishMovie(previewFile);
                     } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         FileLog.e(e);
                     }
                 }
@@ -2920,6 +2953,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                 FileLog.d("InstantCamera handleStopRecording drain encoders");
                 drainEncoder(true);
             } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 FileLog.e(e);
             }
             if (videoEncoder != null) {
@@ -2928,6 +2962,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                     videoEncoder.release();
                     videoEncoder = null;
                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                     FileLog.e(e);
                 }
             }
@@ -2939,6 +2974,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
 
                     setBluetoothScoOn(false);
                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                     FileLog.e(e);
                 }
             }
@@ -2953,6 +2989,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                         try {
                             mediaMuxer.finishMovie();
                         } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                             e.printStackTrace();
                         }
                         countDownLatch.countDown();
@@ -2960,12 +2997,14 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                     try {
                         countDownLatch.await();
                     } catch (InterruptedException e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         e.printStackTrace();
                     }
                 } else {
                     try {
                         mediaMuxer.finishMovie();
                     } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         FileLog.e(e);
                     }
                 }
@@ -2975,6 +3014,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                         try {
                             videoFile.delete();
                         } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                             FileLog.e("InstantCamera copying fileToWrite to videoFile, deleting videoFile error " + videoFile);
                             FileLog.e(e);
                         }
@@ -2985,6 +3025,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                             AndroidUtilities.copyFile(fileToWrite, videoFile);
                             fileToWrite.delete();
                         } catch (IOException e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                             FileLog.e(e);
                             FileLog.e("InstantCamera unable to move file");
                         }
@@ -2998,6 +3039,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                     generateKeyframeThumbsQueue = null;
                 }
             }
+            finishHardwareRun(send != ENCODER_SEND_CANCEL);
             FileLog.d("InstantCamera handleStopRecording send " + send);
             if (send == ENCODER_SEND_CANCEL) {
                 FileLoader.getInstance(currentAccount).cancelFileUpload(videoFile.getAbsolutePath(), false);
@@ -3133,6 +3175,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                             am.stopBluetoothSco();
                         }
                     } catch (Exception e2) {
+                    invalidateHardwareRun("recorder or muxer exception");
                         FileLog.e(e2);
                     }
                 }
@@ -3214,6 +3257,10 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                 videoEncoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                 surface = videoEncoder.createInputSurface();
                 videoEncoder.start();
+                if (!fromPause && benchmarkCamera != null) {
+                    hardwareRun = benchmarkCamera.beginHardwareRecording(CameraHardwareBenchmark.ROUND,
+                            videoWidth, videoHeight, videoBitrate, videoEncoder.getName());
+                }
 
                 if (!fromPause) {
                     boolean isSdCard = ImageLoader.isSdCardPath(videoFile);
@@ -3245,7 +3292,8 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                     }
                     try {
                         performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP, HapticFeedbackConstants.FLAG_IGNORE_GLOBAL_SETTING);
-                    } catch (Exception ignore) {}
+                    } catch (Exception ignore) {
+                    invalidateHardwareRun("recorder or muxer exception");}
                     AndroidUtilities.lockOrientation(delegate.getParentActivity());
                     recordPlusTime = fromPause ? recordedTime : 0;
                     recordStartTime = System.currentTimeMillis();
@@ -3255,6 +3303,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                     NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.recordStarted, recordingGuid, false);
                 });
             } catch (Exception ioe) {
+                    invalidateHardwareRun("recorder or muxer exception");
                 throw new RuntimeException(ioe);
             }
 
@@ -3410,6 +3459,9 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                     }
                     if (videoBufferInfo.size > 1) {
                         if ((videoBufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
+                            CameraHardwareBenchmark.Recording run = hardwareRun;
+                            if (run != null && (videoBufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) == 0)
+                                run.frame(videoBufferInfo.presentationTimeUs, videoBufferInfo.size);
                             if (prependHeaderSize != 0 && (videoBufferInfo.flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0) {
                                 videoBufferInfo.offset += prependHeaderSize;
                                 videoBufferInfo.size -= prependHeaderSize;
@@ -3445,6 +3497,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                                     try {
                                         availableSize = mediaMuxer.writeSampleData(videoTrackIndex, byteBuffer, bufferInfo, true);
                                     } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                                         e.printStackTrace();
                                     }
                                     if (availableSize != 0 && !writingToDifferentFile && allowSendingWhileRecording) {
@@ -3526,6 +3579,7 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
                                 try {
                                     availableSize = mediaMuxer.writeSampleData(audioTrackIndex, byteBuffer, bufferInfo, false);
                                 } catch (Exception e) {
+                    invalidateHardwareRun("recorder or muxer exception");
                                     e.printStackTrace();
                                 }
                                 if (availableSize != 0 && !writingToDifferentFile && allowSendingWhileRecording) {
