@@ -122,7 +122,7 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
     private int focusAreaSize;
     private Drawable thumbDrawable;
 
-    private final boolean useCamera2 = false && SharedConfig.isUsingCamera2(UserConfig.selectedAccount);
+    private final boolean useCamera2 = CameraAutoOptimizer.useCamera2(UserConfig.selectedAccount, "CameraView");
     private final CameraSessionWrapper[] cameraSession = new CameraSessionWrapper[2];
     private CameraSessionWrapper cameraSessionRecording;
 
@@ -2291,9 +2291,15 @@ public class CameraView extends FrameLayout implements TextureView.SurfaceTextur
 
             if (useCamera2) {
                 Camera2Session session = Camera2Session.create(i == 0 ? isFrontface : !isFrontface, surfaceWidth, surfaceHeight);
-                if (session == null) return;
+                if (session == null) {
+                    CameraAutoOptimizer.log("CameraView camera2 session " + i + " was not created for "
+                            + surfaceWidth + "x" + surfaceHeight + "; preview stays black");
+                    return;
+                }
                 cameraSession[i] = CameraSessionWrapper.of(session);
                 previewSize[i] = new Size(session.getPreviewWidth(), session.getPreviewHeight());
+                CameraAutoOptimizer.log("CameraView camera2 session " + i + " created preview="
+                        + previewSize[i] + " frontface=" + (i == 0 ? isFrontface : !isFrontface));
                 cameraThread.setCurrentSession(cameraSession[i], i);
                 session.whenDone(() -> {
                     requestLayout();

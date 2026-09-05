@@ -13,9 +13,12 @@ import android.os.Build;
 import org.telegram.messenger.ApplicationLoader;
 import org.telegram.messenger.BuildVars;
 import org.telegram.messenger.FileLog;
+import org.telegram.messenger.MessagesController;
+import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.Utilities;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 
 public final class CameraAutoOptimizer {
@@ -43,6 +46,39 @@ public final class CameraAutoOptimizer {
         log("enabled=" + enabled + "; reopen camera to reset applied defaults");
     }
 
+    /**
+     * Resolves the camera API for a preview owner and logs why, so a logcat line
+     * explains every fallback to camera1 instead of leaving it unexplained.
+     *
+     * Camera2Session.create() only queries getOutputSizes(SurfaceTexture.class) on
+     * API 23+, so on API 21-22 it always returns null and the caller keeps a black
+     * preview. Those devices stay on camera1 regardless of the user setting.
+     */
+    public static boolean useCamera2(int account, String owner) {
+        boolean setting;
+        try {
+            setting = SharedConfig.isUsingCamera2(account);
+        } catch (RuntimeException e) {
+            error(owner + " camera2 setting unavailable; keeping camera1", e);
+            return false;
+        }
+        String remote;
+        try {
+            remote = String.valueOf(MessagesController.getInstance(account).androidDisableRoundCamera2);
+        } catch (RuntimeException e) {
+            remote = "unavailable";
+        }
+        final boolean supported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.M;
+        final boolean result = setting && supported;
+        log(owner + " api=" + (result ? "camera2" : "camera1")
+                + " setting=" + setting
+                + " userForced=" + SharedConfig.useCamera2Force
+                + " remoteDisableRoundCamera2=" + remote
+                + " sdk=" + Build.VERSION.SDK_INT
+                + " camera2Usable=" + supported);
+        return result;
+    }
+
     /** Reset only this feature's state, never Telegram's camera/user settings. */
     public static synchronized void resetProfiles() {
         boolean enabled = isEnabled();
@@ -66,9 +102,16 @@ public final class CameraAutoOptimizer {
     static final class Profile {
         final String key;
         final String label;
+        private final HashSet<String> notes = new HashSet<>();
         private boolean disabled;
         private String accepted;
         private boolean logged;
+
+        /** Logs a tag at most once per profile: zoom/flash churn rebuilds requests. */
+        synchronized void logOnce(String tag, String message) {
+            if (!notes.add(tag)) return;
+            log(label + " " + message);
+        }
 
         Profile(String key, String label) {
             this.key = key;
@@ -123,6 +166,28 @@ public final class CameraAutoOptimizer {
         FileLog.e(TAG + " " + message, error);
     }
 
+    private static String fpsRanges(List<int[]> ranges) {
+        if (ranges == null) return "null";
+        StringBuilder result = new StringBuilder("[");
+        for (int i = 0; i < ranges.size(); i++) {
+            int[] range = ranges.get(i);
+            if (i > 0) result.append(", ");
+            result.append(range == null || range.length < 2 ? "?" : range[0] + "-" + range[1]);
+        }
+        return result.append("]").toString();
+    }
+
+    private static String sizes(List<Camera.Size> values) {
+        if (values == null) return "null";
+        StringBuilder result = new StringBuilder("[");
+        for (int i = 0; i < values.size(); i++) {
+            Camera.Size size = values.get(i);
+            if (i > 0) result.append(", ");
+            result.append(size == null ? "?" : size.width + "x" + size.height);
+        }
+        return result.append("]").toString();
+    }
+
     private static String focus(List<String> supported, boolean video) {
         if (supported == null) return null;
         String preferred = video ? Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
@@ -152,6 +217,18 @@ public final class CameraAutoOptimizer {
         }
         Profile state = profile("camera1", String.valueOf(cameraId), video ? "video" : "photo",
                 preview.width + "x" + preview.height + "/" + picture.width + "x" + picture.height);
+        try {
+            state.logOnce("capabilities", "capabilities focusModes=" + parameters.getSupportedFocusModes()
+                    + " wbModes=" + parameters.getSupportedWhiteBalance()
+                    + " antibandingModes=" + parameters.getSupportedAntibanding()
+                    + " fpsRanges=" + fpsRanges(parameters.getSupportedPreviewFpsRange())
+                    + " videoSizes=" + sizes(parameters.getSupportedVideoSizes())
+                    + " previewSizes=" + sizes(parameters.getSupportedPreviewSizes())
+                    + " stabilizationSupported=" + parameters.isVideoStabilizationSupported());
+        } catch (RuntimeException e) {
+            // Logging must never break the camera.
+            error(state.label + " capability logging failed", e);
+        }
         if (state.disabled()) {
             camera.setParameters(parameters);
             return;

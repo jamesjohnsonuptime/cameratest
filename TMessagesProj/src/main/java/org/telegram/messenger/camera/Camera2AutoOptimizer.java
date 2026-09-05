@@ -14,6 +14,7 @@ import android.os.Handler;
 import android.util.Range;
 import android.util.Size;
 
+import java.util.Arrays;
 import java.util.List;
 
 @TargetApi(21)
@@ -64,8 +65,8 @@ final class Camera2AutoOptimizer {
 
         Range<Integer> chosen = null;
         long minFrameDuration = 0;
+        int budget = CameraOptimizationPolicy.TARGET_VIDEO_FPS;
         if (!still) {
-            int budget = CameraOptimizationPolicy.TARGET_VIDEO_FPS;
             StreamConfigurationMap streams = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
             if (streams != null) {
                 try {
@@ -120,7 +121,49 @@ final class Camera2AutoOptimizer {
                 + " fps=" + builder.get(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)
                 + " ois=" + builder.get(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE)
                 + " eis=" + builder.get(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE)
-                + " minFrameDurationNs=" + minFrameDuration;
+                + " minFrameDurationNs=" + minFrameDuration
+                + " fpsBudget=" + budget
+                + " stabilizationPlan=" + (ois ? "ois" : eis ? "eis" : "none")
+                + " canOis=" + canOis + " canEis=" + canEis;
+    }
+
+    private static String list(int[] values) {
+        return values == null ? "null" : Arrays.toString(values);
+    }
+
+    /** Everything the HAL advertises for this stream, so a log explains each choice. */
+    private static String describe(CameraCharacteristics characteristics, Size size,
+                                   boolean video, boolean still) {
+        Range<Integer>[] advertised = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        int[][] ranges = null;
+        if (advertised != null) {
+            ranges = new int[advertised.length][];
+            for (int i = 0; i < ranges.length; i++) {
+                if (advertised[i] != null) ranges[i] = new int[]{advertised[i].getLower(), advertised[i].getUpper()};
+            }
+        }
+        long minFrameDuration = -1;
+        StreamConfigurationMap streams = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        if (streams != null) {
+            try {
+                minFrameDuration = streams.getOutputMinFrameDuration(SurfaceTexture.class, size);
+            } catch (RuntimeException unsupportedDuration) {
+                minFrameDuration = -1; // Optional metadata; -1 means "not advertised".
+            }
+        }
+        return "request=" + (still ? "still" : "repeating") + " video=" + video + " stream=" + size
+                + " afModes=" + list(characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES))
+                + " awbModes=" + list(characteristics.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES))
+                + " antibandingModes=" + list(characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES))
+                + " oisModes=" + list(characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION))
+                + " eisModes=" + list(characteristics.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES))
+                + " fpsRanges=" + Arrays.toString(advertised)
+                + " fpsScale=" + CameraOptimizationPolicy.camera2FpsScale(ranges)
+                + " minFrameDurationNs=" + minFrameDuration
+                + " canSetAf=" + canSet(characteristics, CaptureRequest.CONTROL_AF_MODE)
+                + " canSetFps=" + canSet(characteristics, CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE)
+                + " canSetOis=" + canSet(characteristics, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE)
+                + " canSetEis=" + canSet(characteristics, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE);
     }
 
     void repeating(CameraCaptureSession session, CaptureRequest.Builder builder,
@@ -169,6 +212,16 @@ final class Camera2AutoOptimizer {
             profile = CameraAutoOptimizer.profile("camera2", cameraId,
                     still ? (video ? "photo-still-recording" : "photo-still")
                             : video ? "video" : "photo-preview", size.toString());
+            try {
+                profile.logOnce("capabilities", "capabilities " + describe(characteristics, size, video, still));
+            } catch (RuntimeException e) {
+                CameraAutoOptimizer.error(profile.label + " capability logging failed", e);
+            }
+            if (bypass) {
+                profile.logOnce("bypass", "bypassed: barcode/night scene mode keeps template values");
+            } else if (!CameraAutoOptimizer.isEnabled()) {
+                profile.logOnce("kill-switch", "kill switch is off; keeping template values");
+            }
             if (!bypass && CameraAutoOptimizer.isEnabled() && !profile.disabled()) {
                 try {
                     summary = tune(builder, characteristics, size, video, still);

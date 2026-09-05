@@ -80,6 +80,9 @@ public class Camera2Session {
     private ImageReader imageReader;
 
     private long lastTime;
+    private final long createdTime = System.currentTimeMillis();
+    /** Last logged request state; keeps zoom gestures from spamming the log. */
+    private String lastRequestSignature;
 
     public static Camera2Session create(boolean front, int viewWidth, int viewHeight) {
         final Context context = ApplicationLoader.applicationContext;
@@ -121,8 +124,24 @@ public class Camera2Session {
         }
 
         if (cameraId == null || bestSize == null) {
+            CameraAutoOptimizer.log("camera2 create failed: front=" + front
+                    + " view=" + viewWidth + "x" + viewHeight + " sdk=" + Build.VERSION.SDK_INT
+                    + " cameraId=" + cameraId + " size=" + bestSize
+                    + "; no camera advertised a usable SurfaceTexture size, preview would stay black");
             return null;
         }
+        String hardwareLevel = "unknown";
+        try {
+            CameraCharacteristics chosen = cameraManager.getCameraCharacteristics(cameraId);
+            hardwareLevel = String.valueOf(chosen == null ? null
+                    : chosen.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL));
+        } catch (Exception e) {
+            CameraAutoOptimizer.error("camera2 hardware level query failed for camera #" + cameraId, e);
+        }
+        CameraAutoOptimizer.log("camera2 create camera #" + cameraId + " front=" + front
+                + " preview=" + bestSize + " view=" + viewWidth + "x" + viewHeight
+                + " hardwareLevel=" + hardwareLevel
+                + " (0=limited 1=full 2=legacy 3=level_3 4=external)");
         return new Camera2Session(context, front, cameraId, bestSize);
     }
 
@@ -137,6 +156,8 @@ public class Camera2Session {
                 Camera2Session.this.cameraDevice = camera;
                 Camera2Session.this.lastTime = System.currentTimeMillis();
                 FileLog.d("Camera2Session camera #" + cameraId + " opened");
+                CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " device opened "
+                        + (System.currentTimeMillis() - createdTime) + "ms after create");
                 checkOpen();
             }
 
@@ -144,12 +165,16 @@ public class Camera2Session {
             public void onDisconnected(@NonNull CameraDevice camera) {
                 Camera2Session.this.cameraDevice = camera;
                 FileLog.d("Camera2Session camera #" + cameraId + " disconnected");
+                CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " device disconnected "
+                        + (System.currentTimeMillis() - createdTime) + "ms after create");
             }
 
             @Override
             public void onError(@NonNull CameraDevice camera, int error) {
                 Camera2Session.this.cameraDevice = camera;
                 FileLog.e("Camera2Session camera #" + cameraId + " received " + error + " error");
+                CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " device error=" + error
+                        + " (1=disabled 2=in_use 3=max_in_use 4=device 5=service)");
                 AndroidUtilities.runOnUIThread(() -> {
                     isError = true;
                 });
@@ -161,9 +186,13 @@ public class Camera2Session {
             public void onConfigured(@NonNull CameraCaptureSession session) {
                 captureSession = session;
                 FileLog.e("Camera2Session camera #" + cameraId + " capture session configured");
+                CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " capture session configured "
+                        + (System.currentTimeMillis() - createdTime) + "ms after create; preview=" + previewSize);
                 Camera2Session.this.lastTime = System.currentTimeMillis();
                 try {
                     if (!updateCaptureRequest()) {
+                        CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
+                                + " first capture request failed; session marked as error");
                         AndroidUtilities.runOnUIThread(() -> isError = true);
                         return;
                     }
@@ -183,6 +212,9 @@ public class Camera2Session {
             public void onConfigureFailed(@NonNull CameraCaptureSession session) {
                 captureSession = session;
                 FileLog.e("Camera2Session camera #" + cameraId + " capture session failed to configure");
+                CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
+                        + " capture session failed to configure; preview=" + previewSize
+                        + " (surface combination rejected by the HAL)");
                 AndroidUtilities.runOnUIThread(() -> {
                     isError = true;
                 });
@@ -200,8 +232,11 @@ public class Camera2Session {
             sensorSize = cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
             final Float value = cameraCharacteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
             maxZoom = (value == null || value < 1f) ? 1f : value;
+            CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " opening front=" + isFront
+                    + " preview=" + size + " sensor=" + sensorSize + " maxZoom=" + maxZoom);
             cameraManager.openCamera(cameraId, cameraStateCallback, handler);
         } catch (Exception e) {
+            CameraAutoOptimizer.error("Camera2Session camera #" + cameraId + " openCamera failed", e);
             FileLog.e(e);
             AndroidUtilities.runOnUIThread(() -> {
                 isError = true;
@@ -241,8 +276,11 @@ public class Camera2Session {
             ArrayList<Surface> surfaces = new ArrayList<>();
             surfaces.add(surface);
             surfaces.add(imageReader.getSurface());
+            CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " creating capture session with "
+                    + surfaces.size() + " surfaces (preview " + previewSize + " + jpeg reader)");
             cameraDevice.createCaptureSession(surfaces, captureStateCallback, null);
         } catch (Exception e) {
+            CameraAutoOptimizer.error("Camera2Session camera #" + cameraId + " createCaptureSession failed", e);
             FileLog.e(e);
             AndroidUtilities.runOnUIThread(() -> {
                 isError = true;
@@ -390,6 +428,8 @@ public class Camera2Session {
     }
 
     public void destroy(boolean async, Runnable afterCallback) {
+        CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " destroy async=" + async
+                + " alive=" + (System.currentTimeMillis() - createdTime) + "ms");
         isClosed = true;
         autoOptimizer.stop();
         if (async) {
@@ -494,6 +534,14 @@ public class Camera2Session {
                 template = CameraDevice.TEMPLATE_PREVIEW;
             }
             captureRequestBuilder = cameraDevice.createCaptureRequest(template);
+            final String signature = "template=" + template + " recording=" + recordingVideo
+                    + " barcode=" + scanningBarcode + " night=" + nightMode + " flash=" + flashing;
+            if (!signature.equals(lastRequestSignature)) {
+                lastRequestSignature = signature;
+                CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " capture request " + signature
+                        + " zoom=" + currentZoom + " preview=" + previewSize
+                        + " (1=preview 3=record 2=still)");
+            }
 
             if (scanningBarcode) {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_BARCODE);
@@ -532,7 +580,11 @@ public class Camera2Session {
     }
 
     public boolean takePicture(final File file, Utilities.Callback<Integer> whenDone) {
-        if (isClosed || cameraDevice == null || captureSession == null) return false;
+        if (isClosed || cameraDevice == null || captureSession == null) {
+            CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " takePicture skipped: closed=" + isClosed
+                    + " device=" + (cameraDevice != null) + " session=" + (captureSession != null));
+            return false;
+        }
         try {
             CaptureRequest.Builder captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             final int orientation = getJpegOrientation();
@@ -573,6 +625,8 @@ public class Camera2Session {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_BARCODE);
             }
             captureRequestBuilder.addTarget(imageReader.getSurface());
+            CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " still capture orientation="
+                    + orientation + " recording=" + recordingVideo + " barcode=" + scanningBarcode);
             autoOptimizer.capture(captureSession, captureRequestBuilder, cameraCharacteristics,
                     previewSize, cameraId, recordingVideo, scanningBarcode || nightMode, handler);
             return true;
