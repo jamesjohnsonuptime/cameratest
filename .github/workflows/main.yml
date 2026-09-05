@@ -1,7 +1,7 @@
 name: Build Official Telegram APK
 
 on:
-  workflow_dispatch: # Кнопка ручного запуска
+  workflow_dispatch:
 
 jobs:
   build:
@@ -20,15 +20,9 @@ jobs:
 
       - name: Create local.properties and Inject API Keys
         run: |
-          # Создаем файл настроек, который требует чистый Telegram
           echo "sdk.dir=/usr/local/lib/android/sdk" > local.properties
-          
-          # Прописываем ваши реальные API ключи в конфигурацию приложения
-          # (переменные TGLIB_APP_ID и TGLIB_APP_HASH используются в официальном коде)
           echo "TGLIB_APP_ID=${{ secrets.TELEGRAM_API_ID }}" >> local.properties
           echo "TGLIB_APP_HASH=${{ secrets.TELEGRAM_API_HASH }}" >> local.properties
-          
-          # Заполняем обязательные заглушки для Firebase/HockeyApp, без которых чистый TG не соберется
           echo "HOCKEY_APP_HASH=00000000000000000000000000000000" >> local.properties
           echo "FIREBASE_APP_ID=1:000000000000:android:0000000000000000" >> local.properties
 
@@ -36,12 +30,10 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Official Telegram Debug APK
-        # Собираем официальную standalone-версию (без Google Play Services зависимостей, ее проще всего запустить)
         run: ./gradlew assembleBsfDebug --stacktrace
 
       - name: Upload Finished APK
         uses: actions/upload-artifact@v4
         with:
           name: Official-Telegram-Custom
-          # У чистого Telegram путь к готовому файлу отличается от форков
           path: TMessagesProj/build/outputs/apk/bsf/debug/*.apk
