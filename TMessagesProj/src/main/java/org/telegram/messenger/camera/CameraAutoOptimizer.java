@@ -158,7 +158,8 @@ public final class CameraAutoOptimizer {
         }
     }
 
-    static void log(String message) {
+    /** Shared diagnostic entry point for camera code and recorder UI packages. */
+    public static void log(String message) {
         if (BuildVars.LOGS_ENABLED) FileLog.d(TAG + " " + message);
     }
 
