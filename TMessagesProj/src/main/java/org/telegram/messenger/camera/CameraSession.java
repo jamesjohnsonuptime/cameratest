@@ -251,11 +251,11 @@ public class CameraSession {
                     maxZoom = params.getMaxZoom();
 
                     String desiredMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO;
-                    if (params.getSupportedFocusModes().contains(desiredMode)) {
+                    if (params.getSupportedFocusModes() != null && params.getSupportedFocusModes().contains(desiredMode)) {
                         params.setFocusMode(desiredMode);
                     } else {
                         desiredMode = Camera.Parameters.FOCUS_MODE_AUTO;
-                        if (params.getSupportedFocusModes().contains(desiredMode)) {
+                        if (params.getSupportedFocusModes() != null && params.getSupportedFocusModes().contains(desiredMode)) {
                             params.setFocusMode(desiredMode);
                         }
                     }
@@ -280,12 +280,7 @@ public class CameraSession {
                     }
                     params.setFlashMode(currentFlashMode);
                     params.setZoom((int) (currentZoom * maxZoom));
-                    try {
-                        camera.setParameters(params);
-                    } catch (Exception e) {
-                        throw new RuntimeException(e);
-                        //
-                    }
+                    CameraAutoOptimizer.applyLegacy(camera, params, cameraInfo.cameraId, true, false);
 
                     if (params.getMaxNumMeteringAreas() > 0) {
                         meteringAreaSupported = true;
@@ -380,6 +375,11 @@ public class CameraSession {
                     params.setPreviewSize(previewSize.getWidth(), previewSize.getHeight());
                     params.setPictureSize(pictureSize.getWidth(), pictureSize.getHeight());
                     params.setPictureFormat(pictureFormat);
+                    // No setRecordingHint() here on purpose: configurePhotoCamera() also runs
+                    // while the preview is live (onStartRecord, orientation changes). The hint
+                    // only takes effect before startPreview() and some HALs drop or reset the
+                    // stream when it changes mid-preview. configureRoundCamera() still sets it
+                    // before the preview starts, which is where it actually works.
                     params.setJpegQuality(100);
                     params.setJpegThumbnailQuality(100);
                     maxZoom = params.getMaxZoom();
@@ -391,12 +391,13 @@ public class CameraSession {
                             params.setSceneMode(Camera.Parameters.SCENE_MODE_BARCODE);
                         }
                         String desiredMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO;
-                        if (params.getSupportedFocusModes().contains(desiredMode)) {
+                        if (params.getSupportedFocusModes() != null && params.getSupportedFocusModes().contains(desiredMode)) {
                             params.setFocusMode(desiredMode);
                         }
                     } else {
-                        String desiredMode = Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE;
-                        if (params.getSupportedFocusModes().contains(desiredMode)) {
+                        String desiredMode = isVideo ? Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO
+                                : Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE;
+                        if (params.getSupportedFocusModes() != null && params.getSupportedFocusModes().contains(desiredMode)) {
                             params.setFocusMode(desiredMode);
                         }
                     }
@@ -421,11 +422,7 @@ public class CameraSession {
                     }
                     params.setFlashMode(useTorch ? Camera.Parameters.FLASH_MODE_TORCH : currentFlashMode);
 
-                    try {
-                        camera.setParameters(params);
-                    } catch (Exception e) {
-                        //
-                    }
+                    CameraAutoOptimizer.applyLegacy(camera, params, cameraInfo.cameraId, isVideo, optimizeForBarcode);
                 }
             }
         } catch (Throwable e) {
@@ -476,6 +473,12 @@ public class CameraSession {
 
     public void onStartRecord() {
         isVideo = true;
+        useTorch = Camera.Parameters.FLASH_MODE_ON.equals(currentFlashMode);
+        if (isRound) {
+            configureRoundCamera(false);
+        } else {
+            configurePhotoCamera();
+        }
     }
 
     public void setZoom(float value) {
@@ -490,7 +493,7 @@ public class CameraSession {
         }
     }
 
-    protected void configureRecorder(int quality, MediaRecorder recorder) {
+    protected void configureRecorder(int quality, MediaRecorder recorder, Camera.Parameters parameters) {
         updateCameraInfo();
 
         int outputOrientation = 0;
@@ -504,6 +507,11 @@ public class CameraSession {
         recorder.setOrientationHint(outputOrientation);
 
         int highProfile = getHigh();
+        if (CameraAutoOptimizer.isEnabled()) {
+            recorder.setProfile(CameraAutoOptimizer.recorderProfile(cameraInfo.cameraId, highProfile, quality, parameters));
+            isVideo = true;
+            return;
+        }
         boolean canGoHigh = CamcorderProfile.hasProfile(cameraInfo.cameraId, highProfile);
         boolean canGoLow = CamcorderProfile.hasProfile(cameraInfo.cameraId, CamcorderProfile.QUALITY_LOW);
         if (canGoHigh && (quality == 1 || !canGoLow)) {

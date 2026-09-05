@@ -20,8 +20,8 @@ import android.media.ImageReader;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
 import android.util.Log;
-import android.util.Range;
 import android.util.Size;
 import android.util.SizeF;
 import android.view.Surface;
@@ -52,7 +52,8 @@ public class Camera2Session {
 
     private boolean isError;
     private boolean isSuccess;
-    private boolean isClosed;
+    private volatile boolean isClosed;
+    private final Camera2AutoOptimizer autoOptimizer = new Camera2AutoOptimizer();
 
     private final CameraManager cameraManager;
     private final boolean isFront;
@@ -72,7 +73,7 @@ public class Camera2Session {
     private CaptureRequest.Builder captureRequestBuilder;
     private Rect sensorSize;
     private float maxZoom = 1f;
-    private float currentZoom = 1f;
+    private volatile float currentZoom = 1f;
 
     private final Size previewSize;
 
@@ -162,7 +163,10 @@ public class Camera2Session {
                 FileLog.e("Camera2Session camera #" + cameraId + " capture session configured");
                 Camera2Session.this.lastTime = System.currentTimeMillis();
                 try {
-                    updateCaptureRequest();
+                    if (!updateCaptureRequest()) {
+                        AndroidUtilities.runOnUIThread(() -> isError = true);
+                        return;
+                    }
                     AndroidUtilities.runOnUIThread(() -> {
                         isSuccess = true;
                         if (doneCallback != null) {
@@ -347,15 +351,9 @@ public class Camera2Session {
 
         currentZoom = Utilities.clamp(value, maxZoom, 1f);
         updateCaptureRequest();
-
-        try {
-            captureSession.setRepeatingRequest(captureRequestBuilder.build(), null, handler);
-        } catch (Exception e) {
-            FileLog.e(e);
-        }
     }
 
-    private boolean flashing;
+    private volatile boolean flashing;
     public void setFlash(boolean flash) {
         if (flashing != flash) {
             flashing = flash;
@@ -393,6 +391,7 @@ public class Camera2Session {
 
     public void destroy(boolean async, Runnable afterCallback) {
         isClosed = true;
+        autoOptimizer.stop();
         if (async) {
             handler.post(() -> {
                 if (captureSession != null) {
@@ -444,7 +443,7 @@ public class Camera2Session {
         }
     }
 
-    private boolean recordingVideo;
+    private volatile boolean recordingVideo;
     public void setRecordingVideo(boolean recording) {
         if (recordingVideo != recording) {
             recordingVideo = recording;
@@ -452,7 +451,7 @@ public class Camera2Session {
         }
     }
 
-    private boolean scanningBarcode;
+    private volatile boolean scanningBarcode;
     public void setScanningBarcode(boolean scanning) {
         if (scanningBarcode != scanning) {
             scanningBarcode = scanning;
@@ -460,7 +459,7 @@ public class Camera2Session {
         }
     }
 
-    private boolean nightMode;
+    private volatile boolean nightMode;
     public void setNightMode(boolean enable) {
         if (nightMode != enable) {
             nightMode = enable;
@@ -468,8 +467,23 @@ public class Camera2Session {
         }
     }
 
-    private void updateCaptureRequest() {
-        if (cameraDevice == null || surface == null || captureSession == null) return;
+    /**
+     * @return false only when the request could not be applied and the caller should
+     *         treat the session as failed. Work that is merely deferred to the camera
+     *         thread returns true: onConfigured() turns false into isError = true, so
+     *         reporting a deferral as a failure would kill a healthy camera.
+     */
+    private boolean updateCaptureRequest() {
+        if (isClosed) return true;
+        if (Looper.myLooper() != handler.getLooper()) {
+            handler.post(this::updateCaptureRequest); // Deferred, not failed.
+            return true;
+        }
+        if (cameraDevice == null || surface == null || captureSession == null) {
+            CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
+                    + " capture request skipped: device/surface/session unavailable");
+            return false;
+        }
         try {
             int template;
             if (recordingVideo) {
@@ -490,7 +504,6 @@ public class Camera2Session {
             captureRequestBuilder.set(CaptureRequest.FLASH_MODE, flashing ? (recordingVideo ? CaptureRequest.FLASH_MODE_TORCH : CaptureRequest.FLASH_MODE_SINGLE) : CaptureRequest.FLASH_MODE_OFF);
 
             if (recordingVideo) {
-                captureRequestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<Integer>(30, 60));
                 captureRequestBuilder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_VIDEO_RECORD);
             }
 
@@ -509,14 +522,17 @@ public class Camera2Session {
             }
 
             captureRequestBuilder.addTarget(surface);
-            captureSession.setRepeatingRequest(captureRequestBuilder.build(), null, handler);
+            autoOptimizer.repeating(captureSession, captureRequestBuilder, cameraCharacteristics,
+                    previewSize, cameraId, recordingVideo, scanningBarcode || nightMode, handler);
+            return true;
         } catch (Exception e) {
             FileLog.e("Camera2Sessions setRepeatingRequest error in updateCaptureRequest", e);
+            return false;
         }
     }
 
     public boolean takePicture(final File file, Utilities.Callback<Integer> whenDone) {
-        if (cameraDevice == null || captureSession == null) return false;
+        if (isClosed || cameraDevice == null || captureSession == null) return false;
         try {
             CaptureRequest.Builder captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             final int orientation = getJpegOrientation();
@@ -557,7 +573,8 @@ public class Camera2Session {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_BARCODE);
             }
             captureRequestBuilder.addTarget(imageReader.getSurface());
-            captureSession.capture(captureRequestBuilder.build(), new CameraCaptureSession.CaptureCallback() {}, null);
+            autoOptimizer.capture(captureSession, captureRequestBuilder, cameraCharacteristics,
+                    previewSize, cameraId, recordingVideo, scanningBarcode || nightMode, handler);
             return true;
         } catch (Exception e) {
             FileLog.e("Camera2Sessions takePicture error", e);

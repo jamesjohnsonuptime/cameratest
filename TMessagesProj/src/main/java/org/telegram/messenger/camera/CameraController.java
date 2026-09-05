@@ -701,6 +701,8 @@ public class CameraController implements MediaRecorder.OnInfoListener {
                         } catch (Exception e) {
                             FileLog.e(e);
                         }
+                        session.onStartRecord();
+                        Camera.Parameters recordingParameters = camera.getParameters();
                         camera.unlock();
 //                    camera.stopPreview();
                         try {
@@ -709,22 +711,19 @@ public class CameraController implements MediaRecorder.OnInfoListener {
                             recorder.setCamera(camera);
                             recorder.setVideoSource(MediaRecorder.VideoSource.CAMERA);
                             recorder.setAudioSource(MediaRecorder.AudioSource.CAMCORDER);
-                            session.configureRecorder(1, recorder);
+                            session.configureRecorder(1, recorder, recordingParameters);
                             recorder.setOutputFile(path.getAbsolutePath());
                             recorder.setMaxFileSize(1024 * 1024 * 1024);
-                            recorder.setVideoFrameRate(30);
                             recorder.setMaxDuration(0);
-                            Size pictureSize;
-                            pictureSize = new Size(16, 9);
-                            pictureSize = CameraController.chooseOptimalSize(info.getPictureSizes(), 720, 480, pictureSize, false);
-                            int bitrate;
-                            if (Math.min(pictureSize.mHeight, pictureSize.mWidth) >= 720) {
-                                bitrate = 3500000;
-                            } else {
-                                bitrate = 1800000;
+                            // Enabled: keep the validated CamcorderProfile as one coherent tuple.
+                            // Do not replace video dimensions with JPEG picture capabilities.
+                            if (!CameraAutoOptimizer.isEnabled()) {
+                                recorder.setVideoFrameRate(30);
+                                Size pictureSize = CameraController.chooseOptimalSize(info.getPictureSizes(), 720, 480, new Size(16, 9), false);
+                                int bitrate = Math.min(pictureSize.mHeight, pictureSize.mWidth) >= 720 ? 3500000 : 1800000;
+                                recorder.setVideoEncodingBitRate(bitrate);
+                                recorder.setVideoSize(pictureSize.getWidth(), pictureSize.getHeight());
                             }
-                            recorder.setVideoEncodingBitRate(bitrate);
-                            recorder.setVideoSize(pictureSize.getWidth(), pictureSize.getHeight());
                             recorder.setOnInfoListener(CameraController.this);
                             recorder.prepare();
                             recorder.start();
@@ -735,9 +734,18 @@ public class CameraController implements MediaRecorder.OnInfoListener {
                                 AndroidUtilities.runOnUIThread(onVideoStartRecord);
                             }
                         } catch (Exception e) {
-                            recorder.release();
-                            recorder = null;
+                            if (recorder != null) {
+                                recorder.release();
+                                recorder = null;
+                            }
                             FileLog.e(e);
+                            try {
+                                camera.reconnect();
+                                session.stopVideoRecording();
+                                camera.startPreview();
+                            } catch (Exception restoreError) {
+                                CameraAutoOptimizer.error("camera1 restore after recorder failure", restoreError);
+                            }
                         }
                     }
                 } catch (Exception e) {
