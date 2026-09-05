@@ -1,0 +1,5 @@
+      - name: Build with Gradle
+        env:
+          BUY_APP_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          BUY_APP_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: ./gradlew assembleDebug
