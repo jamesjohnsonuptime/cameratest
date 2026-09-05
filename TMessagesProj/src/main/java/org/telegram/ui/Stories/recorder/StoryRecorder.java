@@ -111,6 +111,8 @@ import org.telegram.messenger.UserObject;
 import org.telegram.messenger.Utilities;
 import org.telegram.messenger.VideoEditedInfo;
 import org.telegram.messenger.camera.CameraController;
+import org.telegram.messenger.camera.Camera2Session;
+import org.telegram.messenger.camera.CameraAutoOptimizer;
 import org.telegram.messenger.camera.CameraView;
 import org.telegram.messenger.utils.ViewOutlineProviderImpl;
 import org.telegram.messenger.utils.WindowVisibilityManager;
@@ -3884,7 +3886,11 @@ public class StoryRecorder implements NotificationCenter.NotificationCenterDeleg
                 if (qrScanner != null) {
                     qrScanner.setPaused(true);
                 }
-                takingPhoto = CameraController.getInstance().takePicture(outputFile, true, cameraView.getCameraSessionObject(), (orientation) -> {
+                // Capture the session identity now; the active camera may change
+                // before the asynchronous JPEG callback arrives.
+                final Object photoSession = cameraView.getCameraSessionObject();
+                final boolean camera2Photo = photoSession instanceof Camera2Session;
+                takingPhoto = CameraController.getInstance().takePicture(outputFile, true, photoSession, (orientation) -> {
                     if (useDisplayFlashlight()) {
                         try {
                             windowView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP, HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
@@ -3906,15 +3912,37 @@ public class StoryRecorder implements NotificationCenter.NotificationCenterDeleg
                         h = opts.outHeight;
                     } catch (Exception ignore) {}
 
-                    int rotate = orientation == -1 ? 0 : 90;
-                    if (orientation == -1) {
-                        if (w > h) {
-                            rotate = 270;
+                    // CAMERA_AUTOOPT_STORY_TRANSFORM_BEGIN
+                    int rotate;
+                    int invert = 0;
+                    if (camera2Photo) {
+                        // Reuse Telegram's EXIF rotation + reflection decoder.
+                        // Do not replace 270 with 90 or guess from width/height:
+                        // the HAL may already have rotated the JPEG pixels.
+                        final Pair<Integer, Integer> jpegTransform = AndroidUtilities.getImageOrientation(outputFile);
+                        rotate = jpegTransform.first;
+                        invert = jpegTransform.second;
+                    } else {
+                        // Preserve Camera1's historical ignoreOrientation/flipFront path.
+                        rotate = orientation == -1 ? 0 : 90;
+                        if (orientation == -1) {
+                            if (w > h) {
+                                rotate = 270;
+                            }
+                        } else if (h > w && rotate != 0) {
+                            rotate = 0;
                         }
-                    } else if (h > w && rotate != 0) {
-                        rotate = 0;
                     }
                     StoryEntry entry = StoryEntry.fromPhotoShoot(outputFile, rotate);
+                    if (camera2Photo && entry != null) {
+                        entry.invert = invert;
+                        entry.setupMatrix();
+                        CameraAutoOptimizer.log("StoryRecorder camera2 photo: callbackRotation=" + orientation
+                                + " exifRotation=" + rotate + " exifInvert=" + invert
+                                + " jpegSize=" + w + "x" + h
+                                + " entryRotation=" + entry.orientation + " entryInvert=" + entry.invert);
+                    }
+                    // CAMERA_AUTOOPT_STORY_TRANSFORM_END
                     if (entry != null) {
                         entry.botId = botId;
                         entry.botLang = botLang;
