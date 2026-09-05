@@ -11,9 +11,8 @@ jobs:
       - name: Checkout code with submodules
         uses: actions/checkout@v4
         with:
-          # Скачиваем абсолютно все вложенные репозитории, включая jlatexmath
           submodules: 'recursive'
-          fetch-depth: 0
+          fetch-depth: 1 # Скачиваем только последний коммит, чтобы сэкономить время
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -34,8 +33,12 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Official Telegram Debug APK
-        # Добавляем флаг --no-build-cache, чтобы старый ошибочный лог не мешал сборке
-        run: ./gradlew assembleDebug -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" --no-build-cache --stacktrace
+        env:
+          # Глобально выделяем 6 ГБ памяти на любые фоновые задачи и воркеры Gradle
+          GRADLE_OPTS: "-Xmx6g -Xms2g -XX:MaxMetaspaceSize=1g -Dorg.gradle.workers.max=2"
+        # Передаем параметр -PabiList=arm64-v8a, чтобы компилировать только под современные телефоны. 
+        # Это ускорит сборку в 3 раза и снизит нагрузку на память!
+        run: ./gradlew assembleDebug -PabiList=arm64-v8a --stacktrace
 
       - name: Upload Finished APK
         uses: actions/upload-artifact@v4
