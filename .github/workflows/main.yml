@@ -30,10 +30,12 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Official Telegram Debug APK
-        run: ./gradlew assembleBsfDebug --stacktrace
+        # Используем стандартную команду assembleDebug, которую нашел сам Gradle
+        run: ./gradlew assembleDebug -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=1g" --stacktrace
 
       - name: Upload Finished APK
         uses: actions/upload-artifact@v4
         with:
           name: Official-Telegram-Custom
-          path: TMessagesProj/build/outputs/apk/bsf/debug/*.apk
+          # Ищем любые скомпилированные APK в папках вывода проекта
+          path: "**/build/outputs/apk/**/*.apk"
