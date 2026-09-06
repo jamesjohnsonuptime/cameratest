@@ -44,7 +44,6 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
@@ -80,6 +79,13 @@ public class Camera2Session {
 
     private final CameraManager cameraManager;
     private final boolean isFront;
+    // Same default and contract as CameraSession; captured once per shutter press.
+    private volatile boolean flipFront = true;
+
+    public void setFlipFront(boolean flip) {
+        flipFront = flip;
+        CameraAutoOptimizer.log("camera2 front-photo policy: camera=" + cameraId + " flipFront=" + flip);
+    }
     public final String cameraId;
     private CameraCharacteristics cameraCharacteristics;
 
@@ -131,7 +137,13 @@ public class Camera2Session {
                 }
                 if (bestAspectRatio <= 0 || Math.abs((float) viewWidth / viewHeight - bestAspectRatio) > Math.abs((float) viewWidth / viewHeight - cameraAspectRatio)) {
                     if (confMap != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        Size size = chooseOptimalSize(confMap.getOutputSizes(SurfaceTexture.class), viewWidth, viewHeight, false);
+                        Size[] commonSizes = commonOutputSizes(confMap.getOutputSizes(SurfaceTexture.class),
+                                confMap.getOutputSizes(ImageFormat.JPEG));
+                        Size size = chooseOptimalSize(commonSizes, viewWidth, viewHeight, false);
+                        CameraAutoOptimizer.log("camera2 stream selection: camera=" + id
+                                + " view=" + viewWidth + "x" + viewHeight
+                                + " targetAxes=" + Math.max(viewWidth, viewHeight) + "x" + Math.min(viewWidth, viewHeight)
+                                + " commonPreviewJpegSizes=" + commonSizes.length + " selected=" + size);
                         if (size != null) {
                             bestAspectRatio = cameraAspectRatio;
                             cameraId = id;
@@ -150,7 +162,7 @@ public class Camera2Session {
             CameraAutoOptimizer.log("camera2 create failed: front=" + front
                     + " view=" + viewWidth + "x" + viewHeight + " sdk=" + Build.VERSION.SDK_INT
                     + " cameraId=" + cameraId + " size=" + bestSize
-                    + "; no camera advertised a usable SurfaceTexture size, preview would stay black");
+                    + "; no camera advertised a common SurfaceTexture/JPEG size, preview would stay black");
             return null;
         }
         String hardwareLevel = "unknown";
@@ -162,7 +174,7 @@ public class Camera2Session {
             CameraAutoOptimizer.error("camera2 hardware level query failed for camera #" + cameraId, e);
         }
         CameraAutoOptimizer.log("camera2 create camera #" + cameraId + " front=" + front
-                + " preview=" + bestSize + " view=" + viewWidth + "x" + viewHeight
+                + " preview=" + bestSize + " jpeg=" + bestSize + " view=" + viewWidth + "x" + viewHeight
                 + " hardwareLevel=" + hardwareLevel
                 + " (0=limited 1=full 2=legacy 3=level_3 4=external)");
         return new Camera2Session(context, front, cameraId, bestSize);
@@ -442,7 +454,7 @@ public class Camera2Session {
                     + " displayRotation=" + degrees
                     + " stillJpeg=" + still
                     + " displayAngle=" + getJpegOrientation()
-                    + " mirroredDownstream=false");
+                    + " requestUsesPreviewMirror=false");
             return still;
         } catch (Exception e) {
             CameraAutoOptimizer.error("Camera2Session camera #" + cameraId + " still orientation failed", e);
@@ -464,7 +476,6 @@ public class Camera2Session {
         return getJpegOrientation();
     }
 
-    private final Rect cropRegion = new Rect();
     public void setZoom(float value) {
         if (!isInitiated()) return;
         if (captureRequestBuilder == null || cameraDevice == null || sensorSize == null) return;
@@ -640,19 +651,8 @@ public class Camera2Session {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_CAPTURE_INTENT, CaptureRequest.CONTROL_CAPTURE_INTENT_VIDEO_RECORD);
             }
 
-            if (sensorSize != null && Math.abs(currentZoom - 1f) >= 0.01f) {
-                final int centerX = sensorSize.width() / 2;
-                final int centerY = sensorSize.height() / 2;
-                final int deltaX = (int) ((0.5f * sensorSize.width()) / currentZoom);
-                final int deltaY = (int) ((0.5f * sensorSize.height()) / currentZoom);
-                cropRegion.set(
-                        centerX - deltaX,
-                        centerY - deltaY,
-                        centerX + deltaX,
-                        centerY + deltaY
-                );
-                captureRequestBuilder.set(CaptureRequest.SCALER_CROP_REGION, cropRegion);
-            }
+            Rect crop = cropForZoom(sensorSize, currentZoom);
+            if (crop != null) captureRequestBuilder.set(CaptureRequest.SCALER_CROP_REGION, crop);
 
             captureRequestBuilder.addTarget(surface);
             final boolean neutralScene = !scanningBarcode && !nightMode && !flashing && Math.abs(currentZoom - 1f) < 0.01f;
@@ -678,60 +678,45 @@ public class Camera2Session {
         try {
             CaptureRequest.Builder captureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             final int orientation = getStillJpegOrientation();
+            final boolean mirrorPhoto = isFront && flipFront;
+            final float photoZoom = currentZoom;
+            final Rect photoCrop = cropForZoom(sensorSize, photoZoom);
             captureRequestBuilder.set(CaptureRequest.JPEG_ORIENTATION, orientation);
+            if (photoCrop != null) captureRequestBuilder.set(CaptureRequest.SCALER_CROP_REGION, photoCrop);
             imageReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
                 @Override
                 public void onImageAvailable(ImageReader reader) {
-                    Image image = reader.acquireLatestImage();
-                    if (image == null) {
-                        CameraAutoOptimizer.log("benchmark photo: null JPEG image; not a successful capture");
-                        return;
-                    }
-                    ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-                    byte[] bytes = new byte[buffer.remaining()];
-                    buffer.get(bytes);
-
-                    boolean saved = false;
+                    Image image = null;
+                    final byte[] bytes;
                     try {
-                        try (FileOutputStream output = new FileOutputStream(file)) {
-                            output.write(bytes);
-                            output.flush();
+                        image = reader.acquireLatestImage();
+                        if (image == null) {
+                            CameraAutoOptimizer.log("benchmark photo: null JPEG image; not a successful capture");
+                            finishPhoto(benchmarkShot, new byte[0], orientation, mirrorPhoto, false, false, whenDone);
+                            return;
                         }
-                        saved = true; // Includes successful close, not just write acceptance.
-                    } catch (IOException e) {
-                        FileLog.e(e);
+                        ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+                        bytes = new byte[buffer.remaining()];
+                        buffer.get(bytes);
+                    } catch (RuntimeException | OutOfMemoryError e) {
+                        CameraAutoOptimizer.error("photo JPEG buffer copy failed", e);
+                        finishPhoto(benchmarkShot, new byte[0], orientation, mirrorPhoto, false, false, whenDone);
+                        return;
                     } finally {
-                        image.close();
+                        if (image != null) image.close(); // Release the only ImageReader slot BEFORE CPU/JPEG work.
                     }
-
-                    // JPEG_ORIENTATION is a request, not the residual rotation of
-                    // the encoded JPEG. A HAL may rotate pixels instead of EXIF.
-                    final Pair<Integer, Integer> jpegTransform = AndroidUtilities.getImageOrientation(
-                            new ByteArrayInputStream(bytes));
-                    benchmarkShot.finish(bytes.length, jpegTransform.first, saved);
-                    handler.post(() -> {
-                        autoOptimizer.resumePhoto();
-                        if (!isClosed && !recordingVideo) updateCaptureRequest();
-                    });
-                    CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
-                            + " jpeg result: requested=" + orientation
-                            + " exifRotation=" + jpegTransform.first
-                            + " exifInvert=" + jpegTransform.second
-                            + " bytes=" + bytes.length + " front=" + isFront);
-                    AndroidUtilities.runOnUIThread(() -> {
-                        if (whenDone != null) {
-                            whenDone.run(jpegTransform.first);
-                        }
-                    });
+                    Utilities.globalQueue.postRunnable(() -> savePhoto(file, bytes, orientation,
+                            mirrorPhoto, benchmarkShot, whenDone));
                 }
-            }, null);
+            }, handler);
             if (scanningBarcode) {
                 captureRequestBuilder.set(CaptureRequest.CONTROL_SCENE_MODE, CameraMetadata.CONTROL_SCENE_MODE_BARCODE);
             }
             captureRequestBuilder.addTarget(imageReader.getSurface());
             CameraAutoOptimizer.log("Camera2Session camera #" + cameraId + " still capture orientation="
                     + orientation + " front=" + isFront + " recording=" + recordingVideo
-                    + " barcode=" + scanningBarcode);
+                    + " barcode=" + scanningBarcode + " mirrorForPreview=" + mirrorPhoto
+                    + " zoom=" + photoZoom + " crop=" + photoCrop + " jpeg=" + previewSize);
             autoOptimizer.capture(captureSession, captureRequestBuilder, cameraCharacteristics,
                     previewSize, cameraId, recordingVideo, scanningBarcode || nightMode, handler);
             return true;
@@ -744,29 +729,116 @@ public class Camera2Session {
     }
 
 
+    private void savePhoto(File file, byte[] sourceBytes, int orientation, boolean mirrorPhoto,
+                           CameraHardwareBenchmark.Shot benchmarkShot, Utilities.Callback<Integer> whenDone) {
+        byte[] bytes = sourceBytes;
+        try {
+            bytes = CameraPhotoProcessor.forPreview(sourceBytes, mirrorPhoto);
+        } catch (IOException | RuntimeException | OutOfMemoryError e) {
+            // Preserve the actual shot on allocation/codec failure; never silently claim a mirror.
+            CameraAutoOptimizer.error("photo mirror failed; preserving original JPEG", e);
+        }
+        boolean saved = false;
+        try (FileOutputStream output = new FileOutputStream(file)) {
+            output.write(bytes);
+            output.flush();
+        } catch (IOException e) {
+            CameraAutoOptimizer.error("photo JPEG write failed", e);
+            try {
+                if (file.isFile()) CameraAutoOptimizer.log("failed photo partial JPEG deleted=" + file.delete());
+            } catch (SecurityException cleanupError) {
+                CameraAutoOptimizer.error("failed photo partial JPEG cleanup denied", cleanupError);
+            }
+            finishPhoto(benchmarkShot, bytes, orientation, mirrorPhoto, bytes != sourceBytes, false, whenDone);
+            return;
+        }
+        saved = true; // Includes successful close, not just write acceptance.
+        finishPhoto(benchmarkShot, bytes, orientation, mirrorPhoto, bytes != sourceBytes, saved, whenDone);
+    }
+
+    private void finishPhoto(CameraHardwareBenchmark.Shot benchmarkShot, byte[] bytes, int orientation,
+                             boolean mirrorPhoto, boolean normalized, boolean saved, Utilities.Callback<Integer> whenDone) {
+        // JPEG_ORIENTATION is a request, not the residual rotation of the delivered file.
+        final Pair<Integer, Integer> jpegTransform = saved
+                ? AndroidUtilities.getImageOrientation(new ByteArrayInputStream(bytes)) : new Pair<>(0, 0);
+        benchmarkShot.finish(bytes.length, saved ? jpegTransform.first : -1, saved);
+        handler.post(() -> {
+            autoOptimizer.resumePhoto();
+            if (!isClosed && !recordingVideo) updateCaptureRequest();
+        });
+        CameraAutoOptimizer.log("Camera2Session camera #" + cameraId
+                + " jpeg result: requested=" + orientation + " exifRotation=" + jpegTransform.first
+                + " exifInvert=" + jpegTransform.second + " bytes=" + bytes.length + " front=" + isFront
+                + " mirrorForPreview=" + mirrorPhoto + " normalized=" + normalized + " saved=" + saved);
+        AndroidUtilities.runOnUIThread(() -> {
+            if (whenDone != null) {
+                if (saved) {
+                    whenDone.run(jpegTransform.first);
+                } else {
+                    whenDone.run(-1); // Camera2 failure; callers must not open a partial/missing JPEG.
+                }
+            }
+        });
+    }
+
+    static Rect cropForZoom(Rect sensor, float zoom) {
+        if (sensor == null || sensor.width() < 2 || sensor.height() < 2
+                || Float.isNaN(zoom) || Float.isInfinite(zoom) || zoom < 1.01f) return null;
+        int dx = Math.max(1, (int) (sensor.width() / (2f * zoom)));
+        int dy = Math.max(1, (int) (sensor.height() / (2f * zoom)));
+        int cx = sensor.left + sensor.width() / 2, cy = sensor.top + sensor.height() / 2;
+        return new Rect(cx - dx, cy - dy, cx + dx, cy + dy);
+    }
+
+    static Size[] commonOutputSizes(Size[] preview, Size[] jpeg) {
+        List<Size> common = new ArrayList<>();
+        if (preview != null && jpeg != null) {
+            for (Size p : preview) {
+                if (p == null || p.getWidth() <= 0 || p.getHeight() <= 0) continue;
+                for (Size j : jpeg) {
+                    if (j != null && p.getWidth() == j.getWidth() && p.getHeight() == j.getHeight()) {
+                        common.add(p);
+                        break;
+                    }
+                }
+            }
+        }
+        return common.toArray(new Size[0]);
+    }
+
     public static Size chooseOptimalSize(Size[] choices, int width, int height, boolean notBigger) {
-        List<Size> bigEnoughWithAspectRatio = new ArrayList<>(choices.length);
-        List<Size> bigEnough = new ArrayList<>(choices.length);
-        int w = width;
-        int h = height;
-        for (int a = 0; a < choices.length; a++) {
-            Size option = choices[a];
-            if (notBigger && (option.getHeight() > height || option.getWidth() > width)) {
-                continue;
-            }
-            if (option.getHeight() == option.getWidth() * h / w && option.getWidth() >= width && option.getHeight() >= height) {
-                bigEnoughWithAspectRatio.add(option);
-            } else if (option.getHeight() * option.getWidth() <= width * height * 4 && option.getWidth() >= width && option.getHeight() >= height) {
-                bigEnough.add(option);
+        if (choices == null || choices.length == 0 || width <= 0 || height <= 0) return null;
+        // Compare long/short axes, not portrait view axes against landscape camera buffers.
+        final int w = Math.max(width, height), h = Math.min(width, height);
+        List<Size> exact = new ArrayList<>(), sufficient = new ArrayList<>(), allowed = new ArrayList<>();
+        for (Size option : choices) {
+            if (option == null || option.getWidth() <= 0 || option.getHeight() <= 0) continue;
+            int ow = Math.max(option.getWidth(), option.getHeight());
+            int oh = Math.min(option.getWidth(), option.getHeight());
+            if (notBigger && (ow > w || oh > h)) continue;
+            allowed.add(option);
+            if (ow >= w && oh >= h) {
+                if ((long) ow * h == (long) oh * w) exact.add(option);
+                else if ((long) ow * oh <= (long) w * h * 4) sufficient.add(option);
             }
         }
-        if (bigEnoughWithAspectRatio.size() > 0) {
-            return Collections.min(bigEnoughWithAspectRatio, new CompareSizesByArea());
-        } else if (bigEnough.size() > 0) {
-            return Collections.min(bigEnough, new CompareSizesByArea());
-        } else {
-            return Collections.max(Arrays.asList(choices), new CompareSizesByArea());
+        if (!exact.isEmpty()) return Collections.min(exact, new CompareSizesByArea());
+        List<Size> candidates = sufficient.isEmpty() ? allowed : sufficient;
+        Size best = null;
+        double bestError = Double.POSITIVE_INFINITY;
+        long bestDistance = Long.MAX_VALUE;
+        for (Size candidate : candidates) {
+            double aspect = (double) Math.max(candidate.getWidth(), candidate.getHeight())
+                    / Math.min(candidate.getWidth(), candidate.getHeight());
+            double error = Math.abs(aspect - (double) w / h);
+            long distance = Math.abs((long) candidate.getWidth() * candidate.getHeight() - (long) w * h);
+            if (error < bestError - 1e-9 || (Math.abs(error - bestError) <= 1e-9 && distance < bestDistance)) {
+                best = candidate;
+                bestError = error;
+                bestDistance = distance;
+            }
         }
+        return best; // Never bypass notBigger or select an arbitrary maximum-area fallback.
     }
     static class CompareSizesByArea implements Comparator<Size> {
         @Override
