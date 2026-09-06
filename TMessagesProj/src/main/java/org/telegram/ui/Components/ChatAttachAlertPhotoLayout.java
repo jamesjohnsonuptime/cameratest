@@ -94,6 +94,7 @@ import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.Utilities;
 import org.telegram.messenger.VideoEditedInfo;
 import org.telegram.messenger.camera.CameraAutoOptimizer;
+import org.telegram.messenger.camera.Camera2Session;
 import org.telegram.messenger.camera.CameraController;
 import org.telegram.messenger.camera.CameraView;
 import org.telegram.tgnet.TLRPC;
@@ -1354,12 +1355,14 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
                 final File cameraFile = AndroidUtilities.generatePicturePath(parentAlert.baseFragment instanceof ChatActivity && ((ChatActivity) parentAlert.baseFragment).isSecretChat(), null);
                 final boolean sameTakePictureOrientation = cameraView.getCameraSession().isSameTakePictureOrientation();
                 cameraView.getCameraSession().setFlipFront(parentAlert.baseFragment instanceof ChatActivity || parentAlert.avatarPicker == 2);
-                takingPhoto = CameraController.getInstance().takePicture(cameraFile, false, cameraView.getCameraSessionObject(), (orientation) -> {
+                final Object photoSession = cameraView.getCameraSessionObject();
+                final boolean camera2Photo = photoSession instanceof Camera2Session;
+                takingPhoto = CameraController.getInstance().takePicture(cameraFile, false, photoSession, (orientation) -> {
                     takingPhoto = false;
-                    if (cameraFile == null || parentAlert.destroyed) {
+                    if (cameraFile == null || parentAlert.destroyed || (camera2Photo && orientation == -1)
+                            || !cameraFile.isFile() || cameraFile.length() == 0) {
                         return;
                     }
-//                    Pair<Integer, Integer> orientation = AndroidUtilities.getImageOrientation(cameraFile);
                     mediaFromExternalCamera = false;
                     int width = 0, height = 0;
                     try {
@@ -1371,6 +1374,15 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
                     } catch (Exception ignore) {}
                     MediaController.PhotoEntry photoEntry = new MediaController.PhotoEntry(0, lastImageId--, 0, cameraFile.getAbsolutePath(), orientation == -1 ? 0 : orientation, false, width, height, 0);
                     photoEntry.canDeleteAfter = true;
+                    // CAMERA_AUTOOPT_CHAT_PHOTO_BEGIN
+                    photoEntry.camera2Photo = camera2Photo;
+                    if (camera2Photo) {
+                        photoEntry.setOrientation(AndroidUtilities.getImageOrientation(cameraFile));
+                        CameraAutoOptimizer.log("chat camera2 photo: callbackRotation=" + orientation
+                                + " rotation=" + photoEntry.orientation + " invert=" + photoEntry.invert
+                                + " jpeg=" + width + "x" + height + " initialFit=true");
+                    }
+                    // CAMERA_AUTOOPT_CHAT_PHOTO_END
                     openPhotoViewer(photoEntry, sameTakePictureOrientation, false);
                 });
                 cameraView.startTakePictureAnimation(true);
@@ -2280,6 +2292,19 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
             public boolean scaleToFill() {
                 if (parentAlert.destroyed) {
                     return false;
+                }
+                // Consult the current entry, not the live camera: works after switching,
+                // reopening the draft and reviewing a mixed photo/video capture list.
+                int index = PhotoViewer.getInstance().getCurrentIndex();
+                if (index >= 0 && index < cameraPhotos.size() && parentAlert.avatarPicker == 0) {
+                    Object item = cameraPhotos.get(index);
+                    if (item instanceof MediaController.PhotoEntry) {
+                        MediaController.PhotoEntry photo = (MediaController.PhotoEntry) item;
+                        if (photo.camera2Photo && !photo.isVideo) {
+                            CameraAutoOptimizer.log("chat camera2 viewer: initialScale=fit index=" + index);
+                            return false;
+                        }
+                    }
                 }
                 int locked = Settings.System.getInt(getContext().getContentResolver(), Settings.System.ACCELEROMETER_ROTATION, 0);
                 return sameTakePictureOrientation || locked == 1;
