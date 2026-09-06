@@ -58,7 +58,23 @@ public class CameraController implements MediaRecorder.OnInfoListener {
     private static final int KEEP_ALIVE_SECONDS = 60;
 
     protected ThreadPoolExecutor threadPool;
-    private MediaRecorder recorder;
+    private volatile MediaRecorder recorder;
+    private final java.util.IdentityHashMap<MediaRecorder, CameraHardwareBenchmark.RecordingGuard> legacyProbeGuards = new java.util.IdentityHashMap<>();
+
+    private void releaseLegacyProbeGuard(MediaRecorder owner) {
+        CameraHardwareBenchmark.RecordingGuard guard;
+        synchronized (legacyProbeGuards) { guard = legacyProbeGuards.remove(owner); }
+        if (guard != null) guard.close();
+    }
+
+    private MediaRecorder takeLegacyRecorder(MediaRecorder expected) {
+        synchronized (legacyProbeGuards) {
+            if (expected != null && recorder != expected) return null; // Stale recorder callback.
+            MediaRecorder owned = recorder;
+            recorder = null;
+            return owned;
+        }
+    }
     private String recordedFile;
     private boolean mirrorRecorderVideo;
     protected volatile ArrayList<CameraInfo> cameraInfos;
@@ -705,9 +721,16 @@ public class CameraController implements MediaRecorder.OnInfoListener {
                         Camera.Parameters recordingParameters = camera.getParameters();
                         camera.unlock();
 //                    camera.stopPreview();
+                        final CameraHardwareBenchmark.RecordingGuard photoGuard = CameraHardwareBenchmark.blockPhotoProbes("legacy-video");
+                        boolean recordingStarted = false;
+                        MediaRecorder ownedRecorder = null;
                         try {
                             mirrorRecorderVideo = mirror;
-                            recorder = new MediaRecorder();
+                            ownedRecorder = new MediaRecorder();
+                            synchronized (legacyProbeGuards) {
+                                recorder = ownedRecorder;
+                                legacyProbeGuards.put(ownedRecorder, photoGuard);
+                            }
                             recorder.setCamera(camera);
                             recorder.setVideoSource(MediaRecorder.VideoSource.CAMERA);
                             recorder.setAudioSource(MediaRecorder.AudioSource.CAMCORDER);
@@ -733,10 +756,11 @@ public class CameraController implements MediaRecorder.OnInfoListener {
                             if (onVideoStartRecord != null) {
                                 AndroidUtilities.runOnUIThread(onVideoStartRecord);
                             }
+                            recordingStarted = true;
                         } catch (Exception e) {
-                            if (recorder != null) {
-                                recorder.release();
-                                recorder = null;
+                            if (ownedRecorder != null) {
+                                takeLegacyRecorder(ownedRecorder);
+                                try { ownedRecorder.release(); } catch (Exception releaseError) { FileLog.e(releaseError); }
                             }
                             FileLog.e(e);
                             try {
@@ -745,6 +769,11 @@ public class CameraController implements MediaRecorder.OnInfoListener {
                                 camera.startPreview();
                             } catch (Exception restoreError) {
                                 CameraAutoOptimizer.error("camera1 restore after recorder failure", restoreError);
+                            }
+                        } finally {
+                            if (!recordingStarted) {
+                                releaseLegacyProbeGuard(ownedRecorder);
+                                photoGuard.close(); // Also handles failure in the MediaRecorder constructor.
                             }
                         }
                     }
@@ -829,14 +858,14 @@ public class CameraController implements MediaRecorder.OnInfoListener {
     @Override
     public void onInfo(MediaRecorder mediaRecorder, int what, int extra) {
         if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED || what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_FILESIZE_REACHED || what == MediaRecorder.MEDIA_RECORDER_INFO_UNKNOWN) {
-            MediaRecorder tempRecorder = recorder;
-            recorder = null;
-            if (tempRecorder != null) {
-                tempRecorder.stop();
-                tempRecorder.release();
-            }
-            if (onVideoTakeCallback != null) {
-                finishRecordingVideo(true);
+            MediaRecorder tempRecorder = takeLegacyRecorder(mediaRecorder);
+            if (tempRecorder == null) return;
+            try {
+                try { tempRecorder.stop(); } catch (Exception e) { FileLog.e(e); }
+                try { tempRecorder.release(); } catch (Exception e) { FileLog.e(e); }
+                if (onVideoTakeCallback != null) finishRecordingVideo(true);
+            } finally {
+                releaseLegacyProbeGuard(tempRecorder);
             }
         }
     }
@@ -852,10 +881,9 @@ public class CameraController implements MediaRecorder.OnInfoListener {
             return;
         }
         threadPool.execute(() -> {
+            final MediaRecorder tempRecorder = takeLegacyRecorder(null);
             try {
-                if (recorder != null) {
-                    MediaRecorder tempRecorder = recorder;
-                    recorder = null;
+                if (tempRecorder != null) {
                     try {
                         tempRecorder.stop();
                     } catch (Exception e) {
@@ -910,6 +938,8 @@ public class CameraController implements MediaRecorder.OnInfoListener {
                     onVideoTakeCallback = null;
                 }
             } catch (Exception ignore) {
+            } finally {
+                releaseLegacyProbeGuard(tempRecorder);
             }
         });
     }

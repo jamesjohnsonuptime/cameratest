@@ -6,7 +6,7 @@ package org.telegram.messenger.camera;
 
 /** Pure policy, shared by Camera1 (millifps) and Camera2 (fps). */
 public final class CameraOptimizationPolicy {
-    public static final String VERSION = "0.1.7";
+    public static final String VERSION = "0.1.8";
     public static final int TARGET_VIDEO_FPS = 30;
 
     private CameraOptimizationPolicy() {}

@@ -265,6 +265,14 @@ final class Camera2AutoOptimizer {
         int trials;
         CameraHardwareBenchmark.Book rejectedBook;
         int rejectedCandidate;
+        long rejectedPhotoEpoch;
+        boolean rejectedPhoto;
+        boolean photoWaiting;
+        long requestPhotoEpoch = CameraHardwareBenchmark.photoEpochIfIdle();
+
+        boolean canCacheFallback() {
+            return video || (!photoWaiting && CameraHardwareBenchmark.photoEpochCurrent(requestPhotoEpoch));
+        }
         boolean canMeasure;
         final Runnable watchdog = this::benchmarkTimeout;
 
@@ -330,36 +338,63 @@ final class Camera2AutoOptimizer {
                     if (run != null) measured = run.bind(stream, mask, candidateSignature);
                 } else if (photoBenchmarks && !photoFrozen) {
                     measured = CameraHardwareBenchmark.photo(cameraId, stream, mask, candidateSignature);
-                }
-                if (measured != null) {
-                    choose(measured.candidate);
-                    handler.postDelayed(watchdog, 5500);
+                    photoWaiting = measured == null;
                 }
             }
             try {
+                if (measured != null) {
+                    if (!video) {
+                        if (sendPhotoCandidate(measured)) return;
+                        choose(CameraHardwareBenchmark.BALANCED); // Initial preview, not a trial step.
+                    } else {
+                        choose(measured.candidate);
+                        handler.postDelayed(watchdog, 5500);
+                    }
+                }
                 send();
             } catch (CameraAccessException | RuntimeException e) {
-                if (measured != null) {
-                    restoreMeasured(e);
-                    return;
-                }
-                if (!optimized) {
-                    cancelProbe("baseline unavailable");
-                    throw e;
-                }
+                if (measured != null) { restoreMeasured(e); return; }
+                if (!optimized) { cancelProbe("baseline unavailable"); throw e; }
                 cancelProbe("request rejected");
                 invalidateRecording("request rejected");
                 CameraAutoOptimizer.error(profile.label + " optional request rejected; retry template", e);
                 expected = baseline;
                 optimized = false;
-                fallback = true;
-                send(); // One retry. No persistent blacklist until a real result arrives.
+                fallback = canCacheFallback();
+                if (!video) photoCandidate = CameraHardwareBenchmark.TEMPLATE;
+                if (!fallback) CameraAutoOptimizer.log(profile.label + " template recovery during interference; blacklist unchanged");
+                send();
             }
+        }
+
+        boolean sendPhotoCandidate(CameraHardwareBenchmark.Probe probe) throws CameraAccessException {
+            // The gate is checked atomically with submission, not only at probe creation.
+            synchronized (CameraHardwareBenchmark.PHOTO_LOCK) {
+                if (current == this && !photoFrozen && CameraHardwareBenchmark.photoCurrent(probe)) {
+                    requestPhotoEpoch = probe.photoGeneration;
+                    choose(probe.candidate);
+                    send();
+                    handler.postDelayed(watchdog, 5500);
+                    photoWaiting = false;
+                    return true;
+                }
+            }
+            suspendPhoto("recording gate revoked pending submission");
+            return false;
+        }
+
+        void suspendPhoto(String reason) {
+            cancelProbe(reason);
+            measured = null;
+            photoWaiting = true;
+            CameraAutoOptimizer.log(profile.label + " photo probes paused: " + reason);
         }
 
         void restoreMeasured(Exception error) throws CameraAccessException {
             rejectedBook = measured.book;
             rejectedCandidate = measured.candidate;
+            rejectedPhoto = !video;
+            rejectedPhotoEpoch = measured.photoGeneration;
             cancelProbe("candidate rejected");
             measured = null;
             invalidateRecording("candidate rejected; fallback must not be scored as the original candidate");
@@ -391,36 +426,45 @@ final class Camera2AutoOptimizer {
 
         void benchmarkTimeout() {
             if (current != this || measured == null || measured.done) return;
+            if (!video && !CameraHardwareBenchmark.photoCurrent(measured)) {
+                suspendPhoto("recording gate canceled watchdog");
+                return;
+            }
             if (!measured.ready()) measured.invalidate("no complete sensor window before timeout");
             if (!video && !photoFrozen) advancePhoto();
         }
 
         void advancePhoto() {
             handler.removeCallbacks(watchdog);
+            if (measured == null) return;
+            if (!CameraHardwareBenchmark.photoCurrent(measured)) { suspendPhoto("recording began during sample"); return; }
+            long epoch = measured.photoGeneration;
             measured.finishPhoto();
             int best = measured.book.best();
             boolean complete = measured.book.complete();
             measured = null;
             if (current != this || photoFrozen) return;
+            if (!CameraHardwareBenchmark.photoEpochCurrent(epoch)) { suspendPhoto("recording interrupted sample completion"); return; }
             if (++trials < 3 && !complete && photoBenchmarks) {
                 measured = CameraHardwareBenchmark.photo(cameraId, stream, mask, candidateSignature);
             }
-            if (measured != null) {
-                choose(measured.candidate);
-                handler.postDelayed(watchdog, 5500);
-            } else {
-                choose(best);
-                CameraAutoOptimizer.log(profile.label + " probe sequence stopped; selected=" + best
-                        + " allCandidatesMeasured=" + complete + " (continue next camera open if incomplete)");
-            }
-            try { send(); }
-            catch (CameraAccessException | RuntimeException e) {
-                try {
-                    if (measured != null) restoreMeasured(e);
-                    else {
-                        choose(CameraHardwareBenchmark.TEMPLATE);
+            try {
+                if (measured != null) {
+                    sendPhotoCandidate(measured);
+                } else {
+                    synchronized (CameraHardwareBenchmark.PHOTO_LOCK) {
+                        if (!CameraHardwareBenchmark.photoEpochCurrent(epoch)) { photoWaiting = true; return; }
+                        requestPhotoEpoch = epoch;
+                        choose(best);
                         send();
                     }
+                    CameraAutoOptimizer.log(profile.label + " probe sequence stopped; selected=" + best
+                            + " allCandidatesMeasured=" + complete + " (continue next camera open if incomplete)");
+                }
+            } catch (CameraAccessException | RuntimeException e) {
+                try {
+                    if (measured != null) restoreMeasured(e);
+                    else { choose(CameraHardwareBenchmark.TEMPLATE); send(); }
                 } catch (CameraAccessException | RuntimeException unavailable) {
                     cancelProbe("camera unavailable during probe");
                     CameraAutoOptimizer.error(profile.label + " template restore failed", unavailable);
@@ -432,14 +476,35 @@ final class Camera2AutoOptimizer {
             Long timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP);
             Long exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
             Integer iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
-            long exposureNs = exposure == null ? -1 : exposure;
-            int sensitivity = iso == null ? -1 : iso;
-            CameraHardwareBenchmark.captureLight(cameraId, exposureNs, sensitivity);
-            if (measured == null || measured.done || !video && photoFrozen) return;
             Integer af = result.get(CaptureResult.CONTROL_AF_STATE);
             Integer ae = result.get(CaptureResult.CONTROL_AE_STATE);
-            measured.frame(timestamp == null ? -1 : timestamp,
-                    af == null ? -1 : af, ae == null ? -1 : ae, exposureNs, sensitivity);
+            long exposureNs = exposure == null ? -1 : exposure;
+            int sensitivity = iso == null ? -1 : iso;
+            int aeState = ae == null ? -1 : ae;
+            CameraHardwareBenchmark.captureLight(cameraId, exposureNs, sensitivity, aeState);
+            if (!video) {
+                if (photoFrozen) return;
+                if (measured != null && !CameraHardwareBenchmark.photoCurrent(measured))
+                    suspendPhoto("recording gate interrupted this camera's trial");
+                if (measured == null && photoWaiting && canMeasure && photoBenchmarks
+                        && !CameraHardwareBenchmark.recordingActive()) {
+                    measured = CameraHardwareBenchmark.photo(cameraId, stream, mask, candidateSignature);
+                    if (measured != null) {
+                        trials = 0;
+                        try { sendPhotoCandidate(measured); }
+                        catch (CameraAccessException | RuntimeException e) {
+                            try { restoreMeasured(e); }
+                            catch (CameraAccessException | RuntimeException unavailable) {
+                                cancelProbe("resume failed");
+                                CameraAutoOptimizer.error(profile.label + " photo probe resume failed", unavailable);
+                            }
+                        }
+                    }
+                    return; // This frame belongs to the request BEFORE resume.
+                }
+            }
+            if (measured == null || measured.done) return;
+            measured.frame(timestamp == null ? -1 : timestamp, af == null ? -1 : af, aeState, exposureNs, sensitivity);
             if (measured.ready()) {
                 handler.removeCallbacks(watchdog);
                 if (!video) advancePhoto();
@@ -455,13 +520,20 @@ final class Camera2AutoOptimizer {
             if (!active(request)) return;
             failures = 0;
             if (rejectedBook != null) {
-                rejectedBook.reject(rejectedCandidate);
+                synchronized (CameraHardwareBenchmark.PHOTO_LOCK) {
+                    if (!rejectedPhoto || CameraHardwareBenchmark.photoEpochCurrent(rejectedPhotoEpoch))
+                        rejectedBook.reject(rejectedCandidate);
+                }
                 rejectedBook = null;
             }
             if (!completed) {
                 completed = true;
-                if (fallback) profile.disable("template produced a capture result");
-                else if (optimized) profile.accept(summary + " (capture result received)");
+                if (fallback) {
+                    synchronized (CameraHardwareBenchmark.PHOTO_LOCK) {
+                        if (canCacheFallback()) profile.disable("template produced a capture result");
+                        else CameraAutoOptimizer.log(profile.label + " fallback confirmation interrupted; blacklist unchanged");
+                    }
+                } else if (optimized) profile.accept(summary + " (capture result received)");
             }
             if (!still) measure(result);
         }
@@ -469,6 +541,8 @@ final class Camera2AutoOptimizer {
         @Override
         public void onCaptureFailed(CameraCaptureSession session, CaptureRequest request, CaptureFailure failure) {
             if (!active(request) || failure.getReason() != CaptureFailure.REASON_ERROR) return;
+            if (!still && !video && measured != null && !CameraHardwareBenchmark.photoCurrent(measured))
+                suspendPhoto("recording gate interrupted trial before capture error");
             if (measured != null) {
                 synchronized (measured) { measured.sensor.errors++; measured.invalidate("capture error"); }
             }
@@ -492,7 +566,9 @@ final class Camera2AutoOptimizer {
             CameraAutoOptimizer.log(profile.label + " three consecutive capture errors; retry template once");
             expected = baseline;
             optimized = false;
-            fallback = true;
+            fallback = canCacheFallback();
+            if (!video) photoCandidate = CameraHardwareBenchmark.TEMPLATE;
+            if (!fallback) CameraAutoOptimizer.log(profile.label + " template recovery during interference; blacklist unchanged");
             completed = false;
             failures = 0;
             try {

@@ -24,7 +24,56 @@ public final class CameraHardwareBenchmark {
     private static final long TTL_MS = 7L * 24 * 60 * 60 * 1000;
     private static final HashSet<Object> cameras = new HashSet<>();
     private static final HashMap<String, String> lights = new HashMap<>();
+    // Lock order: a Probe may acquire PHOTO_LOCK; never call a Probe while holding it.
+    // Camera request submission and a recorder's registration share this short lock.
+    static final Object PHOTO_LOCK = new Object();
+    private static final HashSet<RecordingGuard> recorders = new HashSet<>();
     private static Object photoLease;
+    private static long photoEpoch;
+    private static final HashMap<String, CameraIllumination> lightMeters = new HashMap<>();
+    private static final HashMap<String, Long> lightStarted = new HashMap<>();
+
+    public static final class RecordingGuard implements AutoCloseable {
+        private final String scenario;
+        private boolean closed;
+        private RecordingGuard(String scenario) { this.scenario = scenario; }
+        @Override public void close() {
+            int remaining;
+            synchronized (PHOTO_LOCK) {
+                if (closed) return;
+                closed = true;
+                recorders.remove(this);
+                remaining = recorders.size();
+            }
+            CameraAutoOptimizer.log("photo-probe gate recording end=" + scenario + " holders=" + remaining);
+        }
+    }
+
+    /** Register before recorder startup, including Camera1, and close in its terminal finally. */
+    public static RecordingGuard blockPhotoProbes(String scenario) {
+        RecordingGuard guard = new RecordingGuard(scenario);
+        int count;
+        synchronized (PHOTO_LOCK) {
+            recorders.add(guard);
+            photoEpoch++;
+            photoLease = null; // Revoke even a sample that starts and ends between callbacks.
+            count = recorders.size();
+        }
+        CameraAutoOptimizer.log("photo-probe gate recording start=" + scenario + " holders=" + count);
+        return guard;
+    }
+    static boolean recordingActive() { synchronized (PHOTO_LOCK) { return !recorders.isEmpty(); } }
+    static boolean photoCurrent(Probe probe) {
+        synchronized (PHOTO_LOCK) {
+            return recorders.isEmpty() && photoEpoch == probe.photoGeneration && photoLease == probe && !probe.done;
+        }
+    }
+    static long photoEpochIfIdle() {
+        synchronized (PHOTO_LOCK) { return recorders.isEmpty() ? photoEpoch : -1; }
+    }
+    static boolean photoEpochCurrent(long epoch) {
+        synchronized (PHOTO_LOCK) { return recorders.isEmpty() && photoEpoch == epoch; }
+    }
 
     private CameraHardwareBenchmark() {}
     static long now() { return SystemClock.elapsedRealtimeNanos(); }
@@ -33,12 +82,19 @@ public final class CameraHardwareBenchmark {
     static synchronized int cameraCount() { return cameras.size(); }
     static synchronized String lightFor(String id) { String s = lights.get(id); return s == null ? "unknown" : s; }
     static synchronized void noteLight(String id, String light) { if (!"unknown".equals(light)) lights.put(id, light); }
-    private static synchronized void release(Object token) { if (photoLease == token) photoLease = null; }
+    private static void release(Object token) {
+        synchronized (PHOTO_LOCK) { if (photoLease == token) photoLease = null; }
+    }
 
-    static void captureLight(String camera, long exposureNs, int iso) {
-        if (exposureNs <= 0 || iso <= 0) return;
-        double product = exposureNs / 1e6 * iso / 100;
-        noteLight(camera, product < 10 ? "bright" : product < 100 ? "normal" : "low");
+    static synchronized void captureLight(String camera, long exposureNs, int iso, int ae) {
+        long time = now();
+        CameraIllumination meter = lightMeters.get(camera);
+        if (meter == null) {
+            meter = new CameraIllumination(); lightMeters.put(camera, meter); lightStarted.put(camera, time);
+        }
+        if (meter.add(exposureNs, iso, ae, time) && time - lightStarted.get(camera) >= CameraFrameStats.WARMUP_NS) {
+            noteLight(camera, CameraIllumination.bucket(meter.product(), lightFor(camera)));
+        }
     }
 
     static boolean allowed() {
@@ -133,56 +189,95 @@ public final class CameraHardwareBenchmark {
     }
 
     static final class Probe {
-        final String camera, useCase, light;
-        final Book book;
-        final int candidate;
+        final String camera, useCase, stream, signature, lightHint;
+        String light;
+        Book book;
+        final int candidate, mask;
         final int parallel = cameraCount();
-        final CameraFrameStats sensor = new CameraFrameStats(now());
+        final long photoGeneration;
+        CameraFrameStats sensor = new CameraFrameStats(now());
         final long started = now();
-        boolean invalid, done;
+        private final CameraIllumination illumination = new CameraIllumination();
+        private boolean lightFrozen;
+        private String pendingLight;
+        private long pendingSince, lastStableLight;
+        boolean invalid;
+        volatile boolean done;
         String reason;
         Probe(String camera, String useCase, String stream, int mask, String signature, boolean explore) {
-            this.camera = camera; this.useCase = useCase; light = lightFor(camera);
+            this.camera = camera; this.useCase = useCase; this.stream = stream; this.mask = mask; this.signature = signature;
+            light = lightHint = lightFor(camera);
+            synchronized (PHOTO_LOCK) { photoGeneration = photoEpoch; }
             book = new Book(camera, useCase, stream, light, mask, signature);
             candidate = explore ? book.next() : book.best();
             CameraAutoOptimizer.log(book.profile.label + " probe start candidate=" + name(candidate, useCase)
-                    + " warmupMs=700 sampleMs=2000 state=" + (book.complete() ? "verify-cache" : "calibrating"));
+                    + " warmupMs=700 sampleMs=2000 lightPending=true state=" + (book.complete() ? "verify-cache" : "calibrating"));
         }
         synchronized void frame(long timestamp, int af, int ae, long exposure, int iso) {
             if (done || sensor.ready()) return;
+            if (PHOTO.equals(useCase) && !photoCurrent(this)) { invalidate("recording revoked photo trial"); return; }
             if (parallel != cameraCount()) invalidate("camera concurrency changed during sample");
             long time = now();
+            boolean steady = illumination.add(exposure, iso, ae, time);
+            if (!lightFrozen) {
+                if (time - started < CameraFrameStats.WARMUP_NS || !steady) return;
+                light = CameraIllumination.bucket(illumination.product(), lightHint);
+                if (!light.equals(lightHint)) book = new Book(camera, useCase, stream, light, mask, signature);
+                // The chosen candidate stays pinned. Only the destination lighting profile changes.
+                lightFrozen = true;
+                lastStableLight = time;
+                sensor = new CameraFrameStats(time, 0);
+                noteLight(camera, light);
+                CameraAutoOptimizer.log(book.profile.label + " light frozen hint=" + lightHint + " stable=" + light
+                        + " pairedExposureIso=" + illumination.product() + " candidate=" + candidate);
+            } else if (steady) {
+                lastStableLight = time;
+                String next = CameraIllumination.bucket(illumination.product(), light);
+                if (!light.equals(next)) {
+                    if (!next.equals(pendingLight)) { pendingLight = next; pendingSince = time; }
+                    else if (time - pendingSince >= 300_000_000L) invalidate("illumination changed after warmup " + light + " -> " + next);
+                } else pendingLight = null;
+            } else if (time - lastStableLight > 700_000_000L) {
+                invalidate("illumination unstable after warmup");
+            }
             if (sensor.add(timestamp, time, 0)) sensor.metadata(af, ae, exposure, iso);
-            noteLight(camera, sensor.light());
+            if (sensor.ready() && pendingLight != null) invalidate("illumination transition at end of sample");
         }
-        synchronized boolean ready() { return sensor.ready(); }
+        synchronized boolean ready() { return lightFrozen && sensor.ready(); }
         boolean timedOut() { return now() - started > 5_000_000_000L; }
         synchronized void invalidate(String why) { invalid = true; if (reason == null) reason = why; }
         synchronized String problem() {
             if (invalid) return reason;
+            if (PHOTO.equals(useCase) && !photoCurrent(this)) return "recording revoked photo trial";
             if (!allowed()) return "disabled or thermal guard";
+            if (!lightFrozen) return "illumination did not settle after warmup";
             if (!sensor.valid()) return "incomplete/invalid sensor window";
-            if (!light.equals(sensor.light())) return "lighting bucket changed " + light + " -> " + sensor.light();
             return "none";
         }
         synchronized boolean valid() { return "none".equals(problem()); }
         synchronized void finishPhoto() {
             if (done) return;
-            done = true;
-            boolean valid = valid();
+            String why = problem();
+            boolean valid = "none".equals(why);
+            synchronized (PHOTO_LOCK) {
+                if (!photoCurrent(this)) { valid = false; why = "recording revoked photo trial"; }
+                if (valid) book.save(candidate, sensor.score(true));
+                done = true;
+                release(this);
+            }
             CameraAutoOptimizer.log(book.profile.label + " photo probe candidate=" + name(candidate, useCase)
-                    + " valid=" + valid + " reason=" + problem() + " light=" + sensor.light() + " " + sensor.describe());
-            if (valid) book.save(candidate, sensor.score(true));
-            release(this);
+                    + " valid=" + valid + " reason=" + why + " light=" + light + " " + sensor.describe());
         }
         synchronized void cancel(String why) { invalidate(why); done = true; release(this); }
     }
 
-    static synchronized Probe photo(String camera, String stream, int mask, String signature) {
-        if (photoLease != null || !allowed()) return null;
-        Probe p = new Probe(camera, PHOTO, stream, mask, signature, true);
-        photoLease = p;
-        return p;
+    static Probe photo(String camera, String stream, int mask, String signature) {
+        synchronized (PHOTO_LOCK) {
+            if (photoLease != null || !recorders.isEmpty() || !allowed()) return null;
+            Probe p = new Probe(camera, PHOTO, stream, mask, signature, true);
+            photoLease = p;
+            return p;
+        }
     }
 
     /** A pinned clip trial. Owned by the VideoRecorder, not a mutable camera pointer. */
