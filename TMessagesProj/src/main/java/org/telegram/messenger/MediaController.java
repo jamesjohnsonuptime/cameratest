@@ -576,6 +576,8 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
     }
 
     public static class PhotoEntry extends MediaEditState {
+        /** Capture-origin metadata, not an edit: fit Camera2 stills on initial camera review. */
+        public boolean camera2Photo;
         public int bucketId;
         public int imageId;
         public long dateTaken;
@@ -701,6 +703,7 @@ public class MediaController implements AudioManager.OnAudioFocusChangeListener,
         @Override
         public void copyFrom(MediaEditState state) {
             super.copyFrom(state);
+            if (state instanceof PhotoEntry) this.camera2Photo = ((PhotoEntry) state).camera2Photo;
             this.hasSpoiler = state instanceof PhotoEntry && ((PhotoEntry) state).hasSpoiler;
             this.starsAmount = state instanceof PhotoEntry ? ((PhotoEntry) state).starsAmount : 0;
             this.parsedXmp = state instanceof PhotoEntry && ((PhotoEntry) state).parsedXmp;
