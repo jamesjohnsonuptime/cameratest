@@ -14463,7 +14463,9 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
     }
 
     private void setImages() {
-        if (animationInProgress == 0) {
+        // A late open-animation/media callback may arrive after onPhotoClosed.
+        // Local draft files may already have been discarded by the provider.
+        if (isVisible && currentIndex >= 0 && animationInProgress == 0) {
             setIndexToImage(centerImage, currentIndex, null);
             setIndexToPaintingOverlay(currentIndex, paintingOverlay);
             setIndexToImage(rightImage, currentIndex + 1, rightCropTransform);
@@ -18559,6 +18561,7 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
                 centerBlur.destroy();
             }
             if (placeProvider != null && !placeProvider.canScrollAway()) {
+                cancelPendingLocalPhotoLoads(); // Before the provider can delete its camera draft.
                 placeProvider.cancelButtonPressed();
             }
         }
@@ -18636,6 +18639,23 @@ public class PhotoViewer implements NotificationCenter.NotificationCenterDelegat
             Instance = null;
         }
         onHideView();
+    }
+
+    private void cancelPendingLocalPhotoLoads() {
+        if (imagesArrLocals.isEmpty()) return;
+        // Keep displayed bitmaps for the close animation; cancel only pending loads.
+        centerImage.cancelLoadImage();
+        leftImage.cancelLoadImage();
+        rightImage.cancelLoadImage();
+        if (selectedPhotosListView != null) {
+            for (int i = 0; i < selectedPhotosListView.getChildCount(); i++) {
+                View child = selectedPhotosListView.getChildAt(i);
+                if (child instanceof PhotoPickerPhotoCell) {
+                    ((PhotoPickerPhotoCell) child).imageView.getImageReceiver().cancelLoadImage();
+                }
+            }
+        }
+        org.telegram.messenger.camera.CameraAutoOptimizer.log("PhotoViewer local loads canceled before provider close; items=" + imagesArrLocals.size());
     }
 
     private void onPhotoClosed(PlaceProviderObject object) {
