@@ -93,6 +93,7 @@ import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.Utilities;
 import org.telegram.messenger.VideoEditedInfo;
+import org.telegram.messenger.camera.CameraAutoOptimizer;
 import org.telegram.messenger.camera.CameraController;
 import org.telegram.messenger.camera.CameraView;
 import org.telegram.tgnet.TLRPC;
@@ -1847,6 +1848,34 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
         });
     }
 
+    private void cancelCameraCellLoad(View view) {
+        if (view instanceof PhotoAttachPhotoCell) {
+            PhotoAttachPhotoCell cell = (PhotoAttachPhotoCell) view;
+            if (cell.getPhotoEntry() != null && cameraPhotos.contains(cell.getPhotoEntry())) {
+                cell.getImageView().getImageReceiver().cancelLoadImage();
+            }
+        }
+    }
+
+    private void cancelPendingCameraPhotoLoads() {
+        if (gridView != null) gridView.forAllChild(this::cancelCameraCellLoad);
+        if (cameraPhotoRecyclerView != null) cameraPhotoRecyclerView.forAllChild(this::cancelCameraCellLoad);
+    }
+
+    private void deleteCameraDraftFile(String path, String role, String reason) {
+        if (path == null) return;
+        final File draft = new File(path);
+        try {
+            final boolean existed = draft.exists();
+            final boolean deleted = draft.delete();
+            CameraAutoOptimizer.log("camera draft discard reason=" + reason + " role=" + role
+                    + " file=" + draft.getName() + " existed=" + existed + " deleted=" + deleted);
+        } catch (SecurityException e) {
+            CameraAutoOptimizer.log("camera draft discard denied reason=" + reason + " role=" + role + " file=" + draft.getName());
+            FileLog.e(e);
+        }
+    }
+
     public void clearSelectedPhotos() {
         spoilerItem.setText(LocaleController.getString(R.string.EnablePhotoSpoiler));
         spoilerItem.setAnimatedIcon(R.raw.photo_spoiler);
@@ -1860,14 +1889,15 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
             selectedPhotosOrder.clear();
         }
         if (!cameraPhotos.isEmpty()) {
+            cancelPendingCameraPhotoLoads();
             for (int a = 0, size = cameraPhotos.size(); a < size; a++) {
                 MediaController.PhotoEntry photoEntry = (MediaController.PhotoEntry) cameraPhotos.get(a);
-                new File(photoEntry.path).delete();
+                deleteCameraDraftFile(photoEntry.path, "original", "clear-selection");
                 if (photoEntry.imagePath != null) {
-                    new File(photoEntry.imagePath).delete();
+                    deleteCameraDraftFile(photoEntry.imagePath, "edited", "clear-selection");
                 }
                 if (photoEntry.thumbPath != null) {
-                    new File(photoEntry.thumbPath).delete();
+                    deleteCameraDraftFile(photoEntry.thumbPath, "thumb", "clear-selection");
                 }
             }
             cameraPhotos.clear();
@@ -2160,14 +2190,15 @@ public class ChatAttachAlertPhotoLayout extends ChatAttachAlert.AttachAlertLayou
                     CameraController.getInstance().startPreview(cameraView.getCameraSession());
                 }
                 if (cancelTakingPhotos && cameraPhotos.size() == 1) {
+                    cancelPendingCameraPhotoLoads();
                     for (int a = 0, size = cameraPhotos.size(); a < size; a++) {
                         MediaController.PhotoEntry photoEntry = (MediaController.PhotoEntry) cameraPhotos.get(a);
-                        new File(photoEntry.path).delete();
+                        deleteCameraDraftFile(photoEntry.path, "original", "cancel-shot");
                         if (photoEntry.imagePath != null) {
-                            new File(photoEntry.imagePath).delete();
+                            deleteCameraDraftFile(photoEntry.imagePath, "edited", "cancel-shot");
                         }
                         if (photoEntry.thumbPath != null) {
-                            new File(photoEntry.thumbPath).delete();
+                            deleteCameraDraftFile(photoEntry.thumbPath, "thumb", "cancel-shot");
                         }
                     }
                     cameraPhotos.clear();

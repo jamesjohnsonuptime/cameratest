@@ -2423,20 +2423,35 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
             handler.sendMessage(handler.obtainMessage(MSG_VIDEOFRAME_AVAILABLE, (int) (timestamp >> 32), (int) timestamp, cameraId));
         }
 
+        // CAMERA_AUTOOPT_RECORDING_GUARD_BEGIN
         @Override
         public void run() {
-            Looper.prepare();
-            synchronized (sync) {
-                handler = new EncoderHandler(this);
-                ready = true;
-                sync.notify();
-            }
-            Looper.loop();
-
-            synchronized (sync) {
-                ready = false;
+            // Before Looper/encoder startup: this covers Camera1 too. Pause keeps the lease.
+            final CameraHardwareBenchmark.RecordingGuard photoGuard =
+                    CameraHardwareBenchmark.blockPhotoProbes(CameraHardwareBenchmark.ROUND);
+            try {
+                Looper.prepare();
+                synchronized (sync) {
+                    handler = new EncoderHandler(this);
+                    ready = true;
+                    sync.notify();
+                }
+                Looper.loop();
+            } finally {
+                try {
+                    // No-op after a completed trial; abort an unfinished trial on any exit.
+                    finishHardwareRun(false);
+                } finally {
+                    synchronized (sync) {
+                        ready = false;
+                        running = false;
+                        sync.notifyAll();
+                    }
+                    photoGuard.close();
+                }
             }
         }
+        // CAMERA_AUTOOPT_RECORDING_GUARD_END
 
         private void handleAudioFrameAvailable(AudioBufferInfo input) {
             if (pauseRecorder) {
@@ -2773,7 +2788,6 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
 //                    videoEncoder.release();
 //                    videoEncoder = null;
 //                } catch (Exception e) {
-                    invalidateHardwareRun("recorder or muxer exception");
 //                    FileLog.e(e);
 //                }
 //            }
@@ -2785,7 +2799,6 @@ public class InstantCameraView extends FrameLayout implements NotificationCenter
 //
 //                    setBluetoothScoOn(false);
 //                } catch (Exception e) {
-                    invalidateHardwareRun("recorder or muxer exception");
 //                    FileLog.e(e);
 //                }
 //            }
