@@ -3890,7 +3890,12 @@ public class StoryRecorder implements NotificationCenter.NotificationCenterDeleg
                 // before the asynchronous JPEG callback arrives.
                 final Object photoSession = cameraView.getCameraSessionObject();
                 final boolean camera2Photo = photoSession instanceof Camera2Session;
-                takingPhoto = CameraController.getInstance().takePicture(outputFile, true, photoSession, (orientation) -> {
+                final File photoFile = outputFile;
+                takingPhoto = CameraController.getInstance().takePicture(photoFile, true, photoSession, (orientation) -> {
+                    if (outputFile != photoFile) {
+                        CameraAutoOptimizer.log("story photo callback ignored: draft changed during JPEG processing");
+                        return;
+                    }
                     if (useDisplayFlashlight()) {
                         try {
                             windowView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP, HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING);
@@ -3900,7 +3905,8 @@ public class StoryRecorder implements NotificationCenter.NotificationCenterDeleg
                     if (qrScanner != null) {
                         qrScanner.setPaused(false);
                     }
-                    if (outputFile == null) {
+                    if (outputFile == null || (camera2Photo && orientation == -1)
+                            || !outputFile.isFile() || outputFile.length() == 0) {
                         return;
                     }
                     int w = -1, h = -1;
